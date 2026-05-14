@@ -1,0 +1,12 @@
+; DO NOT EDIT (unless you know what you are doing)
+;
+; This subdirectory is a git "subrepo", and this file is maintained by the
+; git-subrepo command. See https://github.com/ingydotnet/git-subrepo#readme
+;
+[subrepo]
+	remote = https://github.com/mitmedialab/arc-line-vectorization-suede
+	branch = release
+	commit = 33ddde836642a093a1d47085305b561a8b4f6106
+	parent = 963c22139df73ac355cbcf5dd8e2e658b1324eb7
+	method = merge
+	cmdver = 0.4.9
