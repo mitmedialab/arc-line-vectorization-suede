@@ -2,12 +2,12 @@
 
 This repo is a [suede dependency](https://github.com/pmalacho-mit/suede). 
 
-To see the installable source code, please checkout the [release branch](https://github.com/mitmedialab/arc-line-vectorization-suede/tree/release).
+To see the installable source code, please checkout the [release branch](https://github.com/mitmedialab/arc_line_vectorization_suede/tree/release).
 
 ## Installation
 
 ```bash
-bash <(curl https://suede.sh/install-release) --repo mitmedialab/arc-line-vectorization-suede
+bash <(curl https://suede.sh/install-release) --repo mitmedialab/arc_line_vectorization_suede
 ```
 
 <details>
@@ -16,7 +16,7 @@ See alternative to using <a href="https://github.com/pmalacho-mit/suede#suedesh"
 </summary>
 
 ```bash
-bash <(curl https://raw.githubusercontent.com/pmalacho-mit/suede/refs/heads/main/scripts/install-release.sh) --repo mitmedialab/arc-line-vectorization-suede
+bash <(curl https://raw.githubusercontent.com/pmalacho-mit/suede/refs/heads/main/scripts/install-release.sh) --repo mitmedialab/arc_line_vectorization_suede
 ```
 
 </details>
