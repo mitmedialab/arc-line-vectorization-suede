@@ -1,6 +1,7 @@
 import numpy as np
 from numpy.typing import NDArray
 from skimage import io
+from skimage.color import rgb2gray, rgba2rgb
 from skimage.morphology import skeletonize as _skeletonize
 
 from .cleanup import collapse_small_holes, CollapseConfig
@@ -11,17 +12,45 @@ from .crossings import (
     resolve_crossings,
 )
 
-from typing import Literal, TypedDict, NamedTuple
+from typing import Literal, TypedDict, NamedTuple, Union
 
 
 class BinarizeConfig(TypedDict):
     threshold: float  # 0.0 to 1.0
 
 
-def to_binary(path: str, config: BinarizeConfig) -> NDArray[np.bool_]:
-    img: np.ndarray = io.imread(path, as_gray=True)
-    if img.dtype != np.float64 and img.dtype != np.float32:
-        img = img / 255.0
+ImageSource = Union[str, np.ndarray]
+
+
+def _to_grayscale_float(img: np.ndarray) -> np.ndarray:
+    """Normalize an arbitrary image array to a float grayscale in [0, 1]."""
+    if img.ndim == 3:
+        if img.shape[-1] == 4:
+            img = rgba2rgb(img)  # also yields float in [0, 1]
+        if img.shape[-1] == 3:
+            return rgb2gray(img)  # float in [0, 1]
+        raise ValueError(
+            f"Unsupported channel count {img.shape[-1]} for 3D image input; "
+            "expected 3 (RGB) or 4 (RGBA)."
+        )
+    if img.ndim != 2:
+        raise ValueError(
+            f"Unsupported image ndim {img.ndim}; expected 2 (grayscale) or 3."
+        )
+    if img.dtype == np.bool_:
+        return img.astype(np.float64)
+    if np.issubdtype(img.dtype, np.integer):
+        return img / np.float64(np.iinfo(img.dtype).max)
+    return img.astype(np.float64, copy=False)
+
+
+def to_binary(source: ImageSource, config: BinarizeConfig) -> NDArray[np.bool_]:
+    if isinstance(source, np.ndarray):
+        img = _to_grayscale_float(source)
+    else:
+        img = io.imread(source, as_gray=True)
+        if img.dtype != np.float64 and img.dtype != np.float32:
+            img = img / 255.0
     return img < config["threshold"]
 
 
@@ -80,13 +109,13 @@ class Skeletonize:
 
     def __init__(
         self,
-        path: str,
+        source: ImageSource,
         binarize_config: Config.Binarize,
         skeletonize_config: Config.Skeletonize,
         collapse_config: Config.Collapse,
         detect_config: Config.Detect,
     ):
-        self.binary = to_binary(path, binarize_config)
+        self.binary = to_binary(source, binarize_config)
         self.skeletonized = skeletonize(self.binary, skeletonize_config)
         self.collapsed = collapse_small_holes(self.skeletonized, collapse_config)
         # Detection uses the BINARY for its distance-transform analysis
