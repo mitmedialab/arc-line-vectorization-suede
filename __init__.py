@@ -3,7 +3,6 @@ from .segment import Segment
 from .graph import StrokeGraph
 from .vectorize.low_geometry import Vectorize as LowGeometryVectorize
 from .vectorize.high_geometry import Vectorize as HighGeometryVectorize
-from .commands import DrawingCommand
 
 import numpy as np
 
