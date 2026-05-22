@@ -29,7 +29,7 @@ Result fields:
 from __future__ import annotations
 import math
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, TypedDict
+from typing import Dict, List, Optional, Sequence, TypedDict
 
 import numpy as np
 from numpy.typing import NDArray
@@ -366,7 +366,7 @@ class Vectorize:
         self.tour = order_primitives(
             self.primitives_fitted, self.start_pos, snap_tol=snap_tol
         )
-        self.commands: List[DrawingCommand] = to_commands(
+        self.commands: Sequence[DrawingCommand] = to_commands(
             self.primitives_fitted,
             self.tour,
             self.start_pos,
@@ -377,7 +377,7 @@ class Vectorize:
         self.tour_consolidated = order_primitives(
             self.primitives_consolidated, self.start_pos, snap_tol=snap_tol
         )
-        self.consolidated: List[DrawingCommand] = to_commands(
+        self.consolidated: Sequence[DrawingCommand] = to_commands(
             self.primitives_consolidated,
             self.tour_consolidated,
             self.start_pos,

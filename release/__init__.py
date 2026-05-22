@@ -4,6 +4,7 @@ from .graph import StrokeGraph
 from .vectorize.low_geometry import Vectorize as LowGeometryVectorize
 from .vectorize.high_geometry import Vectorize as HighGeometryVectorize
 from .optimize import OptimizeRoute
+from .commands import DrawingCommand
 
 import numpy as np
 
