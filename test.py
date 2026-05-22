@@ -129,14 +129,14 @@ class Visualize:
         start_heading: float,
     ):
         commands_to_svg_compare(
-            low.commands,
+            low.consolidated,
             high.commands,
             f"examples/{name}.vectorized.svg",
             start_pos=start_pos,
             start_heading=start_heading,
         )
         commands_to_svg_gif(
-            low.commands,
+            low.consolidated,
             f"examples/{name}.low.vectorized.gif",
             start_pos=(start_pos[0], start_pos[1]),
             start_heading=start_heading,
