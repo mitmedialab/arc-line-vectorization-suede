@@ -272,6 +272,9 @@ def fit_circle(
     return fit_circle_geometric(pts, c0, r0)
 
 
+_MAX_RADIUS_FACTOR = 8.0
+
+
 def fit_arc(pts: NDArray[np.float64]) -> Tuple[Optional[Arc], float]:
     """Fit a circle to the points, then build an arc using the first and
     last points as endpoints. Returns (Arc, rms) or (None, inf) if fit
@@ -285,6 +288,16 @@ def fit_arc(pts: NDArray[np.float64]) -> Tuple[Optional[Arc], float]:
         return None, float("inf")
     c, r, rms = fit_circle(pts)
     if not np.isfinite(r) or r < _EPS:
+        return None, float("inf")
+    # Reject pathologically large radii. A "real" arc spans at least
+    # some non-trivial fraction of its circle, so its radius is bounded
+    # by ``radius <= _MAX_RADIUS_FACTOR * extent``. Beyond that, the fit
+    # is a near-collinear point set that the algebraic solver "rescued"
+    # by placing the center thousands of pixels away — the resulting
+    # arc is visually indistinguishable from a line, but the firmware
+    # time estimator and the downstream joint solver both treat it as
+    # a real arc with a huge wheelbase swing.
+    if r > _MAX_RADIUS_FACTOR * _segment_extent(pts):
         return None, float("inf")
 
     p0 = pts[0]
@@ -353,6 +366,15 @@ def fit_full_circle(
         return None, float("inf")
     c, r, rms = fit_circle(pts)
     if not np.isfinite(r) or r < _EPS:
+        return None, float("inf")
+    # Reject pathological fits where the algebraic solver placed the
+    # circle center far outside the points themselves — see fit_arc for
+    # the same guard. The classic trigger is a tiny near-collinear
+    # patch (e.g. a 4-point horizontal stub) where any Circle is a
+    # perfect fit, including ones with the center thousands of pixels
+    # away. Without this gate, the alien example produced two Circle
+    # primitives with r=40,000 from a 6x1 px patch.
+    if r > _MAX_RADIUS_FACTOR * _segment_extent(pts):
         return None, float("inf")
     return Circle(c, r), rms
 
@@ -751,7 +773,11 @@ def fit_polyline(
             if min(bbox_x, bbox_y) > _EPS:
                 aspect = max(bbox_x, bbox_y) / min(bbox_x, bbox_y)
             else:
-                aspect = 1.0
+                # One axis is degenerate (zero spread) — the polyline is
+                # effectively collinear. Treat as infinite aspect so the
+                # Circle shortcut is rejected; the caller will fall through
+                # to chain subdivision, which will fit a Line.
+                aspect = float("inf")
             if aspect < 1.25:
                 return [ChainPiece(0, n, circle)]
         # Otherwise fall through; the DP will handle rounded rectangles.
