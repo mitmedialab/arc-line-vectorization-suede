@@ -39,7 +39,7 @@ from ...commands import DrawingCommand
 from ...graph import StrokeGraph
 
 from .beautify import BeautifyTolerances, detect, merge_arc_pairs, merge_into
-from .fitting import ChainPiece, fit_polyline, fuse_chain
+from .fitting import ChainPiece, fit_polyline, fuse_chain, is_near_closed_polyline
 from .manifest import (
     Coincide,
     G1Smooth,
@@ -279,6 +279,32 @@ class Vectorize:
                         soft_.g1.append(
                             G1Smooth(a=a_pid, alpha_a=1.0, b=b_pid, alpha_b=0.0)
                         )
+
+                # Wrap-around joint for near-closed polylines. The graph
+                # builder only marks polylines with endpoint gap < 1.5 px
+                # as closed (and only those get a self-junction that
+                # pulls both ends together). Hand-drawn loops often
+                # close with a 2-5 px gap — graph treats one end as a
+                # terminal that happens to share a junction with another
+                # stroke, leaving the OTHER end floating. Routing then
+                # sees the two chain ends as separate vertices and
+                # emits a wasteful pen-up + back-track between them
+                # (the ghostclock bottom-of-body junction was the
+                # canonical case). Adding a Coincide between the
+                # chain's first.start and last.end pulls them together
+                # via the solver, so the routing's endpoint clustering
+                # then collapses them into one vertex.
+                if len(pids) >= 2:
+                    poly = self.graph.polylines[seg.polyline_index]
+                    if is_near_closed_polyline(poly, abs_tol=5.0):
+                        first_pid = pids[0]
+                        last_pid = pids[-1]
+                        first_is_circle = isinstance(prims[first_pid], Circle)
+                        last_is_circle = isinstance(prims[last_pid], Circle)
+                        if not (first_is_circle or last_is_circle):
+                            soft_.coincide.append(
+                                Coincide((last_pid, "end"), (first_pid, "start"))
+                            )
             return soft_
 
         # Phase 2: junction-derived constraints. Coincide ALWAYS at
