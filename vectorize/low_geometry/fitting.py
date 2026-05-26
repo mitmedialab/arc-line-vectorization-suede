@@ -188,6 +188,83 @@ def count_corners(
     ))
 
 
+def find_inflections(
+    pts: NDArray[np.float64],
+    smooth_window: int = 4,
+    sign_threshold: float = 0.03,
+    min_sustain: int = 3,
+    min_separation: int = 12,
+) -> List[int]:
+    """Return polyline indices at which the curvature reverses sign in
+    a sustained way — the stroke smoothly switches from turning one
+    direction to turning the other (a classic S-curve).
+
+    These are NOT corners. The polyline is tangent-continuous at the
+    inflection (no kink), but no single Line or Arc can represent the
+    span on both sides, so chain subdivision has to split there. The
+    existing ``find_corners`` only fires on tangent-direction
+    discontinuities (≥50° turn), so smooth inflections slip through —
+    the topdown recursion is then left to find the inflection via
+    residual-argmax, which doesn't reliably pick the right index
+    (angel poly 2's wing-bottom: a 58-point S-curve where residual
+    argmax stayed near the boundary, the recursion nibbled 4 pts
+    per level, hit max_depth, and the forced-terminal fell back to a
+    chord-line that visibly cut through the angel's face).
+
+    Algorithm: smooth the tangent direction, compute signed cross
+    products of consecutive smoothed tangents (which is signed turn
+    rate), and report an inflection when ``min_sustain`` samples of
+    one sign appear immediately before ``min_sustain`` samples of the
+    other sign (with magnitude above ``sign_threshold`` to ignore
+    noise). Non-max suppression: merge inflections closer than
+    ``min_separation``.
+
+    Indices returned are positions in the input ``pts`` array.
+    """
+    n = len(pts)
+    if n < 2 * (smooth_window + min_sustain) + 2:
+        return []
+    diffs = np.diff(pts, axis=0)
+    if len(diffs) < smooth_window + 1:
+        return []
+    smoothed = np.empty((len(diffs) - smooth_window + 1, 2), dtype=np.float64)
+    for k in range(len(smoothed)):
+        v = diffs[k:k + smooth_window].sum(axis=0)
+        nrm = float(np.linalg.norm(v))
+        smoothed[k] = (0.0, 0.0) if nrm < _EPS else v / nrm
+    if len(smoothed) < 2:
+        return []
+    cross = (
+        smoothed[:-1, 0] * smoothed[1:, 1]
+        - smoothed[:-1, 1] * smoothed[1:, 0]
+    )
+
+    # Walk the cross array looking for a stretch of "all positive
+    # above threshold" immediately followed by "all negative above
+    # threshold" (or vice versa).
+    inflections: List[int] = []
+    last_inflection_pos = -min_separation
+    half_offset = smooth_window // 2 + 1  # map cross-index back to pts-index
+    nc = len(cross)
+    i = min_sustain
+    while i < nc - min_sustain:
+        left = cross[i - min_sustain:i]
+        right = cross[i:i + min_sustain]
+        if (
+            np.all(left > sign_threshold) and np.all(right < -sign_threshold)
+        ) or (
+            np.all(left < -sign_threshold) and np.all(right > sign_threshold)
+        ):
+            pos = i + half_offset
+            if pos - last_inflection_pos >= min_separation:
+                inflections.append(pos)
+                last_inflection_pos = pos
+            i += min_separation
+        else:
+            i += 1
+    return inflections
+
+
 # ---------------------------------------------------------------------------
 # Single-primitive fitters
 
@@ -478,9 +555,28 @@ def fit_single_primitive(
     arc_ok = arc is not None and arc_rms < arc_tol_abs
     arc_sse = (arc_rms ** 2) * n if arc is not None else float("inf")
 
-    # Prefer line when both work and line SSE isn't much worse — fewer
-    # parameters, simpler downstream routing, doesn't suffer from bulge
-    # numerics. The "1.5x" gives arcs a fair shot when the curve is real.
+    # Prefer Arc when both fit AND the arc has visually meaningful
+    # curvature. Without this, the chain subdivider would emit a Line
+    # for any stroke whose sagitta happens to be below line_tol — even
+    # if the underlying curve sweeps tens of degrees. Each subsequent
+    # output line+spin pair then represents geometry that one arc
+    # command could draw faster (and visually correctly). 10° is the
+    # threshold at which sagitta/chord ≈ 0.022, i.e. about 2% of chord
+    # — large enough to be visually clear, small enough not to misfire
+    # on near-straight noise. See angel poly 2's wing and birdlove
+    # poly 2's heart top.
+    arc_min_sweep_rad = math.radians(10.0)
+    if (
+        arc_ok
+        and arc is not None
+        and abs(arc.sweep()) >= arc_min_sweep_rad
+    ):
+        return arc, arc_sse
+
+    # Otherwise prefer Line when both work and line SSE isn't much
+    # worse than arc SSE — fewer parameters, simpler downstream
+    # routing, no bulge numerics. The "1.5x" gives arcs a fair shot
+    # when the curve is real but below the meaningful-sweep gate.
     if line_ok and (not arc_ok or line_sse <= 1.5 * arc_sse):
         return line, line_sse
     if arc_ok:
@@ -552,8 +648,20 @@ def fit_segment_topdown(
         # ``worst + 1 < hi`` keeps it strictly smaller. ``worst > lo``
         # keeps the second child strictly smaller.
         if worst <= lo or worst + 1 >= hi:
-            # Couldn't find a valid split; accept the whole window as-is.
-            prim = line
+            # Couldn't find a valid split; accept the whole window
+            # as-is. Use ``fit_single_primitive`` with relaxed
+            # tolerance so the same Arc-vs-Line preference fires
+            # here as elsewhere — defaulting to Line means windows
+            # of real curvature get linified at exactly the points
+            # the algorithm has the least information (the angel
+            # wing's bottom edge ended up here, at 19.8° of sweep,
+            # but the bail-out picked Line so a slanted edge cut
+            # straight through the angel's face).
+            prim, _ = fit_single_primitive(
+                pts[lo:hi], line_tol_abs * 4, arc_tol_abs * 4
+            )
+            if prim is None:
+                prim = line
             pieces.append(ChainPiece(lo, hi, prim))
             return
 
@@ -750,6 +858,115 @@ def find_closed_subloop(
     return None
 
 
+def _line_collapse(
+    pieces: List[ChainPiece],
+    source_points: List[NDArray[np.float64]],
+    line_tol_abs: float,
+) -> Tuple[List[ChainPiece], List[NDArray[np.float64]]]:
+    """Collapse runs of consecutive Lines (and small Arcs) whose union
+    of source points fits a single Line within ``line_tol_abs``.
+
+    Why this exists separately from the main greedy fusion: the main
+    pass uses ``_has_curvature_reversal`` to refuse fusing across S-
+    curves, which is necessary when the candidate is an Arc (the fit
+    averages opposing curvatures to a near-zero sweep that wrong-
+    renders the geometry). For a Line candidate that protection is
+    moot — ``line_rms`` already rejects S-curves (the centerline is
+    far from both halves) and accepts noise around a straight stretch
+    (rms stays small). Dropping the guard lets the line-collapse find
+    cases like angel poly 13's `[L(8), L(10), L(7)]` tail and angel
+    poly 14's `[L(10), L(7), L(4), L(8)]` tail — runs that the chain
+    subdivider broke up but which are visually one straight stroke.
+
+    Arcs are also eligible. A small Arc bracketed by Lines whose union
+    still fits a single Line (e.g., 5° sweep in the middle of a 100 px
+    near-straight stretch) gets folded in. A large Arc fails the line
+    fit naturally because its sagitta dominates rms. ``Circle`` is
+    always skipped (a closed loop can never project onto a line).
+
+    Single-piece "windows" are NOT modified — replacing a standalone
+    Arc with its chord-line would silently throw away legitimate
+    curvature. Collapse only happens when we successfully extend past
+    the first piece.
+    """
+    n = len(pieces)
+    if n < 2:
+        return pieces, source_points
+
+    # Pre-compute the sweep sign of each piece (0 for lines / tiny arcs).
+    # Used to detect when extending the window would span an S-curve —
+    # an arc of one sign followed by an arc of the opposite sign means
+    # the underlying stroke turns both ways. ``line_rms`` happily
+    # averages opposing curvatures (the deviations cancel), so it can
+    # not flag the S-curve on its own; without this guard,
+    # birdlove's heart-top S-curves got flattened into a polyline.
+    arc_sign_threshold_rad = math.radians(8.0)
+    sweep_signs: List[int] = []
+    for c in pieces:
+        p = c.primitive
+        if isinstance(p, Arc) and abs(p.sweep()) >= arc_sign_threshold_rad:
+            sweep_signs.append(1 if p.sweep() > 0 else -1)
+        else:
+            sweep_signs.append(0)
+
+    out_pieces: List[ChainPiece] = []
+    out_src: List[NDArray[np.float64]] = []
+    i = 0
+    while i < n:
+        prim_i = pieces[i].primitive
+        if isinstance(prim_i, Circle):
+            out_pieces.append(pieces[i])
+            out_src.append(source_points[i])
+            i += 1
+            continue
+
+        best_j = i + 1
+        best_line: Optional[Line] = None
+        best_pts: Optional[NDArray[np.float64]] = None
+
+        # Sign of the first signed-arc we've encountered in the window
+        # (0 means we haven't seen one yet). Once set, any new piece
+        # with the OPPOSITE sign breaks the window.
+        seen_sign = sweep_signs[i]
+
+        for j in range(i + 2, n + 1):
+            if isinstance(pieces[j - 1].primitive, Circle):
+                break
+            nxt_sign = sweep_signs[j - 1]
+            if nxt_sign != 0:
+                if seen_sign != 0 and nxt_sign != seen_sign:
+                    # Opposite-sign arcs in the same window — don't
+                    # collapse to a line, that would silently
+                    # straighten out an S-curve.
+                    break
+                seen_sign = nxt_sign
+            concat = np.vstack(source_points[i:j])
+            if len(concat) < 2:
+                break
+            cand_line, cand_rms = fit_line(concat)
+            if cand_rms >= line_tol_abs:
+                break
+            best_j = j
+            best_line = cand_line
+            best_pts = concat
+
+        if best_line is not None and best_pts is not None:
+            out_pieces.append(
+                ChainPiece(
+                    pieces[i].start_idx,
+                    pieces[best_j - 1].end_idx,
+                    best_line,
+                )
+            )
+            out_src.append(best_pts)
+        else:
+            out_pieces.append(pieces[i])
+            out_src.append(source_points[i])
+        i = best_j
+
+    return out_pieces, out_src
+
+
 def _is_degenerate(prim: Primitive) -> bool:
     """A primitive is degenerate if it represents essentially no
     geometry — a near-zero-length Line, or an Arc with near-zero sweep.
@@ -942,14 +1159,31 @@ def fuse_chain(
             if len(concat) >= 3:
                 arc, arc_rms = fit_arc(concat)
 
-            # Prefer Line when it fits — fewer parameters, no bulge
-            # numerics, and ``fit_arc``'s radius cap already drops
-            # near-line arcs. Only fall back to Arc if Line is over
-            # tolerance but Arc fits.
+            # Same Arc-vs-Line preference as ``fit_single_primitive``:
+            # when both fit, an Arc with visually meaningful sweep
+            # wins over a Line. This is what prevents the main
+            # fusion from converting a run of small same-direction
+            # arcs (birdlove heart top) into a polyline, just
+            # because the polyline approximation happens to fit
+            # within line_tol. Below 10° sweep the arc is too flat
+            # to read as curved, so we still prefer the simpler
+            # Line.
             candidate: Optional[Primitive] = None
-            if line_rms < line_tol_abs:
+            arc_min_sweep_rad = math.radians(10.0)
+            arc_ok = (
+                arc is not None
+                and arc_rms < arc_tol_abs
+            )
+            arc_meaningful = (
+                arc_ok
+                and arc is not None
+                and abs(arc.sweep()) >= arc_min_sweep_rad
+            )
+            if arc_meaningful:
+                candidate = arc
+            elif line_rms < line_tol_abs:
                 candidate = line
-            elif arc is not None and arc_rms < arc_tol_abs:
+            elif arc_ok:
                 candidate = arc
 
             if candidate is None:
@@ -973,6 +1207,15 @@ def fuse_chain(
             )
             new_src.append(source_points[i])
             i += 1
+
+    # Phase 2: line-collapse. The main pass above uses the curvature-
+    # reversal guard which is needed for the Arc-candidate branch but
+    # over-rejects sequences of small Lines (and Lines + small Arcs)
+    # whose union would happily fit a single Line. Run a second pass
+    # without the guard, using ``fit_line``'s RMS as the only gate —
+    # which naturally rejects S-curves (high centerline rms) while
+    # accepting noise around a near-straight stroke.
+    new_pieces, new_src = _line_collapse(new_pieces, new_src, line_tol_abs)
 
     return new_pieces, new_src
 
@@ -1082,7 +1325,20 @@ def fit_polyline(
     splits: List[int] = list(corners)
     if subloop is not None:
         splits.extend(subloop)
-        splits = sorted(set(splits))
+    # Also split at smooth curvature reversals (S-curve inflections).
+    # ``find_corners`` only fires on tangent-direction discontinuities
+    # (kinks ≥50°); a polyline that smoothly switches from CCW to CW
+    # turning has no kink and slips through. Without an explicit split,
+    # the topdown recursion can't fit a single primitive across the
+    # reversal (an S-curve isn't an arc), and its forced-terminal
+    # branch falls back to a chord-line that visually misrepresents
+    # the geometry — see angel poly 2's wing-bottom. Splitting at the
+    # inflection turns the S-curve into two single-direction halves
+    # that the recursive fit handles cleanly.
+    inflections = find_inflections(pts)
+    if inflections:
+        splits.extend(inflections)
+    splits = sorted(set(splits))
     if splits:
         pieces: List[ChainPiece] = []
         split_idxs = [0] + splits + [n]
