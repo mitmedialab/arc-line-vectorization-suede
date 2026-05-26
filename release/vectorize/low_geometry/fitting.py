@@ -275,6 +275,51 @@ def fit_circle(
 _MAX_RADIUS_FACTOR = 8.0
 
 
+def _has_curvature_reversal(
+    pts: NDArray[np.float64],
+    smooth_window: int = 4,
+    min_turns_each_sign: int = 2,
+    sign_threshold: float = 0.05,
+) -> bool:
+    """Detect whether a polyline turns in BOTH directions (an S-curve or
+    zigzag), which means a single Line or Arc would mis-represent it.
+
+    Computes a smoothed tangent at each point, then signs of consecutive
+    smoothed-tangent cross products. If at least ``min_turns_each_sign``
+    samples turn each way (after thresholding small noise via
+    ``sign_threshold``), it's a reversal. Used inside ``fuse_chain`` to
+    refuse fusing across inflections that would otherwise average out.
+    """
+    n = len(pts)
+    if n < 2 * smooth_window + 2:
+        return False
+    diffs = np.diff(pts, axis=0)
+    nd = len(diffs)
+    if nd < smooth_window + 1:
+        return False
+    # Smooth the tangent by summing windows of consecutive segments,
+    # then normalize. This filters out per-pixel jitter.
+    smoothed = np.empty((nd - smooth_window + 1, 2), dtype=np.float64)
+    for k in range(nd - smooth_window + 1):
+        v = diffs[k:k + smooth_window].sum(axis=0)
+        nrm = float(np.linalg.norm(v))
+        if nrm < _EPS:
+            smoothed[k] = np.array([0.0, 0.0])
+        else:
+            smoothed[k] = v / nrm
+    if len(smoothed) < 2:
+        return False
+    # Cross product of consecutive smoothed tangents: sign indicates
+    # turn direction. Positive = CCW in image coords (=CW on screen).
+    cross = (
+        smoothed[:-1, 0] * smoothed[1:, 1]
+        - smoothed[:-1, 1] * smoothed[1:, 0]
+    )
+    pos = int(np.sum(cross > sign_threshold))
+    neg = int(np.sum(cross < -sign_threshold))
+    return pos >= min_turns_each_sign and neg >= min_turns_each_sign
+
+
 def fit_arc(pts: NDArray[np.float64]) -> Tuple[Optional[Arc], float]:
     """Fit a circle to the points, then build an arc using the first and
     last points as endpoints. Returns (Arc, rms) or (None, inf) if fit
@@ -695,6 +740,148 @@ def find_closed_subloop(
                     refined_i, refined_j = ii, jj
         return (refined_i, refined_j)
     return None
+
+
+def fuse_chain(
+    pieces: List[ChainPiece],
+    source_points: List[NDArray[np.float64]],
+    primitives: List[Primitive],
+    line_tol_rel: float = 0.006,
+    arc_tol_rel: float = 0.025,
+    line_tol_abs_min: float = 1.0,
+    arc_tol_abs_min: float = 2.5,
+) -> Tuple[List[ChainPiece], List[NDArray[np.float64]]]:
+    """Greedy within-chain fusion: merge runs of consecutive primitives
+    whose union of source points still fits a single Line or Arc within
+    tolerance.
+
+    This catches the case where chain subdivision over-segments a gentle
+    curve: each small piece individually fits a Line within ``line_tol``,
+    but stitched together they're really a single Arc. The user-level
+    output is then ``line spin line spin line spin …`` instead of one
+    arc command — visually similar but draws much slower.
+
+    Boundaries: this function operates within ONE chain (one
+    ``FittedSegment``) at a time, so it never crosses StrokeGraph
+    junctions — graph topology is preserved. Circles are skipped (they
+    represent closed loops and aren't fusable with adjacent open
+    primitives).
+
+    Tolerances scale with the chain's bounding-box diagonal, with an
+    absolute floor so very short chains still get meaningful tolerance.
+    The defaults are ~3x looser than the chain-subdivision tolerance,
+    because the hypothesis here is "these were fit as separate pieces
+    only because the noise-floor per piece is below tolerance" — the
+    union still has the same noise floor, so the fit RMS for the union
+    is roughly the RMS of any one piece. Without some headroom over the
+    per-piece tolerance, nothing ever fuses.
+
+    Returns the new ``(pieces, source_points)`` lists. Caller is
+    responsible for rebuilding the global primitive list and primitive-
+    id mapping (typically via ``assign_global_ids``).
+    """
+    n = len(pieces)
+    if n <= 1:
+        # Rewrap the single piece around its current primitive (which
+        # may have been updated by the solver since pieces was built).
+        if n == 0:
+            return [], []
+        return (
+            [ChainPiece(pieces[0].start_idx, pieces[0].end_idx, primitives[0])],
+            [source_points[0]],
+        )
+
+    # Chain-wide extent for tolerance scaling.
+    all_pts = np.vstack(source_points)
+    extent = _segment_extent(all_pts)
+    line_tol_abs = max(line_tol_rel * extent, line_tol_abs_min)
+    arc_tol_abs = max(arc_tol_rel * extent, arc_tol_abs_min)
+
+    new_pieces: List[ChainPiece] = []
+    new_src: List[NDArray[np.float64]] = []
+
+    i = 0
+    while i < n:
+        # Circles aren't fusable — emit as-is.
+        if isinstance(primitives[i], Circle):
+            new_pieces.append(
+                ChainPiece(pieces[i].start_idx, pieces[i].end_idx, primitives[i])
+            )
+            new_src.append(source_points[i])
+            i += 1
+            continue
+
+        # Walk j outward from i+1 and keep the largest window for which
+        # the union of source points still fits a single Line or Arc.
+        # Including j=i+1 here also "re-fits" single pieces: the joint
+        # solver can pull an Arc's radius outward to satisfy adjacent
+        # constraints, leaving us with a near-line that ``fit_arc``
+        # would now reject via its radius cap. Refitting forces those
+        # cases to come back as Lines.
+        best_j = i
+        best_prim: Optional[Primitive] = None
+        best_pts: Optional[NDArray[np.float64]] = None
+
+        for j in range(i + 1, n + 1):
+            # Bail when the next primitive is a Circle.
+            if j > i + 1 and isinstance(primitives[j - 1], Circle):
+                break
+
+            concat = np.vstack(source_points[i:j])
+            if len(concat) < 2:
+                break
+
+            # Curvature-reversal guard. If the concatenated points turn
+            # in BOTH directions, this span is an S-curve / zigzag.
+            # Fitting a single Line averages the wiggles flat; fitting a
+            # single Arc averages the opposite-curvature halves into a
+            # near-zero sweep. Either way the visual detail is lost, so
+            # refuse to extend the window across the reversal. Cheap
+            # checks (sign on primitives' sweeps alone) miss the
+            # frequent case where chain subdivision split an S-curve
+            # into short Lines that have no curvature signal.
+            if j > i + 1 and _has_curvature_reversal(concat):
+                break
+
+            line, line_rms = fit_line(concat)
+            arc: Optional[Arc] = None
+            arc_rms = float("inf")
+            if len(concat) >= 3:
+                arc, arc_rms = fit_arc(concat)
+
+            # Prefer Line when it fits — fewer parameters, no bulge
+            # numerics, and ``fit_arc``'s radius cap already drops
+            # near-line arcs. Only fall back to Arc if Line is over
+            # tolerance but Arc fits.
+            candidate: Optional[Primitive] = None
+            if line_rms < line_tol_abs:
+                candidate = line
+            elif arc is not None and arc_rms < arc_tol_abs:
+                candidate = arc
+
+            if candidate is None:
+                break
+
+            best_j = j
+            best_prim = candidate
+            best_pts = concat
+
+        if best_prim is not None and best_pts is not None:
+            start = pieces[i].start_idx
+            end = pieces[best_j - 1].end_idx
+            new_pieces.append(ChainPiece(start, end, best_prim))
+            new_src.append(best_pts)
+            i = best_j
+        else:
+            # Couldn't fit even the single piece (rare: very short
+            # piece or pathological data). Keep the upstream primitive.
+            new_pieces.append(
+                ChainPiece(pieces[i].start_idx, pieces[i].end_idx, primitives[i])
+            )
+            new_src.append(source_points[i])
+            i += 1
+
+    return new_pieces, new_src
 
 
 def fit_polyline(

@@ -39,7 +39,7 @@ from ...commands import DrawingCommand
 from ...graph import StrokeGraph
 
 from .beautify import BeautifyTolerances, detect, merge_arc_pairs, merge_into
-from .fitting import ChainPiece, fit_polyline
+from .fitting import ChainPiece, fit_polyline, fuse_chain
 from .manifest import (
     Coincide,
     G1Smooth,
@@ -229,71 +229,78 @@ class Vectorize:
                 source_points[pid] = src
         self.source_points = source_points
 
-        # Phase 2: junction-derived constraints.
-        soft = build_junction_constraints(
-            self.graph,
-            self.fitted_segments,
-            smooth_junction_deg=self.fit_config.smooth_junction_deg_threshold,
-            primitives=self.primitives_initial,
-        )
-        # Add internal chain joint constraints. Coincide ALWAYS — we
-        # want consecutive primitives to share an endpoint. G1 ONLY
-        # when the joint is actually smooth: top-down splitting puts
-        # chain breakpoints at sharp corners (the apex of a cat ear,
-        # the cusp of a heart), where the two adjoining primitives
-        # have materially different tangents. Adding G1 there forces
-        # the joint to smooth out — which rounds off the corner and
-        # turns a triangular ear into a trapezoidal blob. So we
-        # measure the tangent deflection at the joint and skip G1
-        # past the threshold.
+        smooth_thresh_rad = math.radians(self.fit_config.smooth_junction_deg_threshold)
+
+        def _build_constraints(
+            segments: List[FittedSegment], prims: List[Primitive]
+        ) -> SoftConstraints:
+            """Junction + internal-chain-joint constraints for the
+            current ``(segments, prims)`` state. Called once initially
+            and again after the within-chain fusion pass (which
+            renumbers primitive ids and changes which primitive ids are
+            adjacent inside a chain).
+
+            See the long-form notes baked into the original inline
+            version for the Circle vs Arc/Line joint handling and the
+            G1 deflection gate.
+            """
+            soft_ = build_junction_constraints(
+                self.graph,
+                segments,
+                smooth_junction_deg=self.fit_config.smooth_junction_deg_threshold,
+                primitives=prims,
+            )
+            for seg in segments:
+                pids = seg.primitive_ids
+                for k in range(len(pids) - 1):
+                    a_pid = pids[k]
+                    b_pid = pids[k + 1]
+                    a_is_circle = isinstance(prims[a_pid], Circle)
+                    b_is_circle = isinstance(prims[b_pid], Circle)
+                    if a_is_circle and not b_is_circle:
+                        soft_.on_curve.append(
+                            OnCurve(terminating=(b_pid, "start"), host=a_pid)
+                        )
+                    elif b_is_circle and not a_is_circle:
+                        soft_.on_curve.append(
+                            OnCurve(terminating=(a_pid, "end"), host=b_pid)
+                        )
+                    else:
+                        soft_.coincide.append(
+                            Coincide((a_pid, "end"), (b_pid, "start"))
+                        )
+                    if a_is_circle or b_is_circle:
+                        continue
+                    t_end = tangent_at_end(prims[a_pid], "end")
+                    t_start = tangent_at_end(prims[b_pid], "start")
+                    dot = float(np.clip(np.dot(t_end, t_start), -1.0, 1.0))
+                    deflection = math.acos(dot)
+                    if deflection < smooth_thresh_rad:
+                        soft_.g1.append(
+                            G1Smooth(a=a_pid, alpha_a=1.0, b=b_pid, alpha_b=0.0)
+                        )
+            return soft_
+
+        # Phase 2: junction-derived constraints. Coincide ALWAYS at
+        # internal joints — we want consecutive primitives to share an
+        # endpoint. G1 ONLY when the joint is actually smooth: top-down
+        # splitting puts chain breakpoints at sharp corners (the apex
+        # of a cat ear, the cusp of a heart), where the two adjoining
+        # primitives have materially different tangents. Adding G1
+        # there would round the corner. So we measure tangent
+        # deflection and skip G1 past ``smooth_junction_deg_threshold``.
         #
         # EXCEPTION: when one of the two consecutive primitives is a
         # Circle (chain produced by sub-loop extraction — the loop
         # part fits as a Circle, the rest fits as an Arc), Coincide
-        # would force the Circle's theta=0 to match the Arc's
-        # endpoint. theta=0 is the arbitrary convention point on the
-        # Circle (center + (r, 0)), so a hard match there pulls the
-        # entire circle to satisfy it (vasesun's sun went from r=90
-        # to r=1077 because the solver shifted the center 1500px
-        # away to put theta=0 at the stem-top junction). Use
-        # OnCurve instead — the Arc's endpoint must lie SOMEWHERE
-        # on the Circle's perimeter, not at a specific point.
-        smooth_thresh_rad = math.radians(self.fit_config.smooth_junction_deg_threshold)
-        for seg in self.fitted_segments:
-            pids = seg.primitive_ids
-            for k in range(len(pids) - 1):
-                a_pid = pids[k]
-                b_pid = pids[k + 1]
-                a_is_circle = isinstance(self.primitives_initial[a_pid], Circle)
-                b_is_circle = isinstance(self.primitives_initial[b_pid], Circle)
-                if a_is_circle and not b_is_circle:
-                    soft.on_curve.append(
-                        OnCurve(terminating=(b_pid, "start"), host=a_pid)
-                    )
-                elif b_is_circle and not a_is_circle:
-                    soft.on_curve.append(
-                        OnCurve(terminating=(a_pid, "end"), host=b_pid)
-                    )
-                elif a_is_circle and b_is_circle:
-                    # Two adjacent Circles in a chain is unusual but
-                    # not impossible. Treat as concentric (their centers
-                    # coincide) rather than endpoint-coincide.
-                    soft.coincide.append(Coincide((a_pid, "end"), (b_pid, "start")))
-                else:
-                    soft.coincide.append(Coincide((a_pid, "end"), (b_pid, "start")))
-                # G1 only applies between primitives with meaningful
-                # tangent endpoints (skip if either is a Circle, since
-                # tangent_at_end on a Circle is at the arbitrary theta=0
-                # point and isn't meaningful for chain joints).
-                if a_is_circle or b_is_circle:
-                    continue
-                t_end = tangent_at_end(self.primitives_initial[a_pid], "end")
-                t_start = tangent_at_end(self.primitives_initial[b_pid], "start")
-                dot = float(np.clip(np.dot(t_end, t_start), -1.0, 1.0))
-                deflection = math.acos(dot)
-                if deflection < smooth_thresh_rad:
-                    soft.g1.append(G1Smooth(a=a_pid, alpha_a=1.0, b=b_pid, alpha_b=0.0))
-        self.soft_initial = soft
+        # would force the Circle's theta=0 (an arbitrary convention
+        # point) to match the Arc's endpoint, which pulls the entire
+        # circle to satisfy it (vasesun's sun went from r=90 to r=1077
+        # because the solver shifted the center 1500px away to put
+        # theta=0 at the stem-top junction). Use OnCurve instead.
+        self.soft_initial = _build_constraints(
+            self.fitted_segments, self.primitives_initial
+        )
 
         # Phase 3: first solve.
         pos_scale = _bbox_diag(self.graph)
@@ -309,9 +316,54 @@ class Vectorize:
             )
         else:
             primitives_fitted = []
-            result = SolveResult([], [], soft, True, 0.0, 0)
+            result = SolveResult([], [], self.soft_initial, True, 0.0, 0)
         self.primitives_fitted = primitives_fitted
         self.solve_result = result
+
+        # Phase 3.5: within-chain fusion.
+        #
+        # The chain subdivider's per-piece tolerances are tight; on
+        # hand-drawn curves with noisy strokes, a gentle arc can fail
+        # the single-arc fit while each ~5px sub-window fits a line
+        # well. The result is a "line spin line spin …" chain that
+        # represents what should have been one arc command. We
+        # post-process each chain by greedily fusing runs of
+        # consecutive primitives whose union still fits a single
+        # Line/Arc within a (looser) tolerance. Chain boundaries are
+        # respected — graph junctions stay intact.
+        if primitives_fitted:
+            new_segments: List[FittedSegment] = []
+            for seg in self.fitted_segments:
+                chain_prims = [primitives_fitted[pid] for pid in seg.primitive_ids]
+                fused_pieces, fused_src = fuse_chain(
+                    seg.pieces, seg.source_points, chain_prims
+                )
+                new_segments.append(
+                    FittedSegment(
+                        polyline_index=seg.polyline_index,
+                        pieces=fused_pieces,
+                        primitive_ids=[],  # filled by assign_global_ids below
+                        source_points=fused_src,
+                    )
+                )
+            n_before = len(primitives_fitted)
+            self.fitted_segments = new_segments
+            self.primitives_fitted = assign_global_ids(self.fitted_segments)
+            # Refresh the global source-points map with the new ids.
+            new_source: Dict[int, NDArray] = {}
+            for seg in self.fitted_segments:
+                for pid, src in zip(seg.primitive_ids, seg.source_points):
+                    new_source[pid] = src
+            source_points = new_source
+            self.source_points = source_points
+            self.n_fused = n_before - len(self.primitives_fitted)
+            # Regenerate constraints against the new primitive ids.
+            self.soft_initial = _build_constraints(
+                self.fitted_segments, self.primitives_fitted
+            )
+            primitives_fitted = self.primitives_fitted
+        else:
+            self.n_fused = 0
 
         # Phase 4: beautification + re-solve.
         if self.beautify_enabled and primitives_fitted:
