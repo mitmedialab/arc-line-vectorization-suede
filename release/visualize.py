@@ -316,6 +316,103 @@ def commands_to_svg_compare(
     return svg
 
 
+def commands_to_svg_compare_n(
+    panels: Sequence[Tuple[Sequence[DrawingCommand], str]],
+    output_path: Optional[str] = None,
+    start_pos: Tuple[float, float] = (0.0, 0.0),
+    start_heading: float = 0.0,
+    stroke_width: float = 1.5,
+    pen_up_stroke_width: float = 0.5,
+    padding: float = 8.0,
+    panel_gap: float = 24.0,
+    label_height: float = 28.0,
+    show_pen_up: bool = True,
+):
+    """Render N command lists side by side at the same scale, with a
+    text label drawn above each.
+
+    Generalises ``commands_to_svg_compare`` from two panels to an
+    arbitrary number. Like the two-panel version, every panel shares a
+    single unified bounding box (the union of each drawing's padded
+    bbox) so a primitive at world-space (X, Y) appears at the same
+    panel-relative pixel in every panel — the visual diff between
+    drawings stays meaningful even when their extents differ slightly.
+
+    Args:
+        panels: list of ``(commands, label)`` pairs in left-to-right
+            order. ``label`` is the text drawn centred above the
+            panel — callers typically encode an identifier and the
+            estimated firmware drawing time, e.g.
+            ``"optimized (1062.71s)"``.
+    """
+    if not panels:
+        raise ValueError("panels must be non-empty")
+
+    sim = []
+    for commands, label in panels:
+        drawn, pen_up, bbox = _simulate(commands, start_pos, start_heading)
+        sim.append((label, drawn, pen_up, bbox))
+
+    minx = min(s[3][0] for s in sim) - padding
+    miny = min(s[3][1] for s in sim) - padding
+    maxx = max(s[3][2] for s in sim) + padding
+    maxy = max(s[3][3] for s in sim) + padding
+    panel_w = maxx - minx
+    panel_h = maxy - miny
+
+    n = len(sim)
+    total_w = n * panel_w + (n - 1) * panel_gap
+    total_h = panel_h + label_height
+    label_baseline = label_height * 0.7
+    font_size = label_height * 0.5
+
+    parts = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" '
+        f'viewBox="0 0 {total_w:.2f} {total_h:.2f}" '
+        f'width="{total_w:.0f}" height="{total_h:.0f}">',
+        '<rect width="100%" height="100%" fill="white" />',
+    ]
+    # Vertical separators between panels.
+    for i in range(1, n):
+        sx = i * panel_w + (i - 1) * panel_gap + panel_gap / 2.0
+        parts.append(
+            f'<line x1="{sx:.2f}" y1="{label_height:.2f}" '
+            f'x2="{sx:.2f}" y2="{total_h:.2f}" '
+            f'stroke="#e0e0e0" stroke-width="0.5" />'
+        )
+    # Centred label above each panel.
+    for i, (label, _drawn, _pu, _bbox) in enumerate(sim):
+        cx = i * panel_w + i * panel_gap + panel_w / 2.0
+        parts.append(
+            f'<text x="{cx:.2f}" y="{label_baseline:.2f}" '
+            f'text-anchor="middle" font-family="sans-serif" '
+            f'font-size="{font_size:.2f}" fill="#333">{label}</text>'
+        )
+    # Each panel's drawing in its own translated group.
+    for i, (_label, drawn, pen_up, _bbox) in enumerate(sim):
+        x_offset = i * panel_w + i * panel_gap - minx
+        parts.append(
+            f'<g transform="translate({x_offset:.2f}, {label_height - miny:.2f})">'
+        )
+        parts.extend(
+            _render_drawing_parts(
+                drawn,
+                pen_up,
+                stroke_width,
+                pen_up_stroke_width,
+                show_pen_up,
+            )
+        )
+        parts.append("</g>")
+    parts.append("</svg>")
+
+    svg = "\n".join(parts)
+    if output_path is not None:
+        with open(output_path, "w") as f:
+            f.write(svg)
+    return svg
+
+
 def _primitive_length(primitive: dict) -> float:
     if primitive["kind"] == "line":
         return float(np.linalg.norm(primitive["p1"] - primitive["p0"]))
@@ -500,6 +597,207 @@ def commands_to_svg_gif(
         output_path,
         save_all=True,
         append_images=frames[1:],
+        optimize=False,
+        duration=frame_ms,
+        loop=0,
+    )
+    return output_path
+
+
+def commands_to_svg_gif_compare_n(
+    panels: Sequence[Tuple[Sequence[DrawingCommand], str]],
+    output_path: str,
+    start_pos: Tuple[float, float] = (0.0, 0.0),
+    start_heading: float = 0.0,
+    stroke_width: int = 2,
+    padding: float = 8.0,
+    scale: float = 4.0,
+    fps: int = 24,
+    duration_s: Optional[float] = None,
+    units_per_second: float = 60.0,
+    max_total_frames: int = 240,
+    max_pixels_per_frame: int = 400_000,
+    show_pen_up: bool = True,
+    pen_up_stroke_width: int = 1,
+    panel_gap_px: int = 12,
+    label_height_px: int = 32,
+) -> str:
+    """Animated GIF comparing N command lists side by side.
+
+    Animation timing: each panel advances proportionally to the length
+    drawn so far (same heuristic as ``commands_to_svg_gif``). The total
+    animation duration is set by the panel with the longest total
+    drawn length, so faster panels finish first — visually you can see
+    which sequence draws more efficiently. Panels that finish early
+    just hold on their final frame for the rest of the animation.
+
+    Each panel's image shares the SAME world-space bounding box (union
+    of all panel bboxes + padding) so a primitive at (X, Y) sits at
+    the same pixel position in every panel; the visual diff stays
+    meaningful even when the panels' extents differ.
+
+    Args:
+        panels: list of ``(commands, label)`` in left-to-right order.
+            ``label`` is centred above the panel.
+    """
+    if not panels:
+        raise ValueError("panels must be non-empty")
+
+    panel_data = []
+    for commands, label in panels:
+        drawn, pen_up, bbox = _simulate(commands, start_pos, start_heading)
+        lengths = [_primitive_length(d) for d in drawn]
+        total_length = float(sum(lengths))
+        panel_data.append((label, drawn, pen_up, bbox, lengths, total_length))
+
+    minx = min(p[3][0] for p in panel_data) - padding
+    miny = min(p[3][1] for p in panel_data) - padding
+    maxx = max(p[3][2] for p in panel_data) + padding
+    maxy = max(p[3][3] for p in panel_data) + padding
+    panel_w_units = max(1e-6, maxx - minx)
+    panel_h_units = max(1e-6, maxy - miny)
+    n_panels = len(panel_data)
+
+    panel_w_px = max(1, int(math.ceil(panel_w_units * scale)))
+    panel_h_px = max(1, int(math.ceil(panel_h_units * scale)))
+    total_w_px = n_panels * panel_w_px + (n_panels - 1) * panel_gap_px
+    total_h_px = panel_h_px + label_height_px
+
+    # Pixel budget per frame — if we're over, shrink scale to fit.
+    if max_pixels_per_frame > 0 and total_w_px * total_h_px > max_pixels_per_frame:
+        shrink = math.sqrt(
+            max_pixels_per_frame / float(total_w_px * total_h_px)
+        )
+        scale *= shrink
+        panel_w_px = max(1, int(math.ceil(panel_w_units * scale)))
+        panel_h_px = max(1, int(math.ceil(panel_h_units * scale)))
+        total_w_px = n_panels * panel_w_px + (n_panels - 1) * panel_gap_px
+        total_h_px = panel_h_px + label_height_px
+
+    def map_pt(p) -> Tuple[float, float]:
+        return ((float(p[0]) - minx) * scale, (float(p[1]) - miny) * scale)
+
+    # Pick the panel with the longest total draw to set the absolute
+    # frame budget. Every panel gets a frame budget proportional to
+    # its own length, so shorter panels finish before the GIF ends.
+    max_total_length = max(p[5] for p in panel_data)
+    if duration_s is None:
+        duration_s = max(1.0, max_total_length / max(1e-6, units_per_second))
+    total_frames = max(1, int(round(duration_s * max(1, fps))))
+    if max_total_frames > 0:
+        total_frames = min(total_frames, max_total_frames)
+
+    # Per-panel: build base (pen-up dashes) and produce a stream of
+    # per-frame images. Pad with the final base for any panel that
+    # finishes before ``total_frames``.
+    per_panel_frame_imgs: List[List[Image.Image]] = []
+    for label, drawn, pen_up, _bbox, lengths, total_length in panel_data:
+        base = Image.new("RGB", (panel_w_px, panel_h_px), "white")
+        base_draw = ImageDraw.Draw(base)
+        if show_pen_up:
+            for p0, p1 in pen_up:
+                base_draw.line(
+                    [map_pt(p0), map_pt(p1)],
+                    fill=(190, 190, 190),
+                    width=pen_up_stroke_width,
+                )
+
+        frames_for_panel = max(
+            1,
+            int(round(total_frames * (total_length / max(1e-6, max_total_length)))),
+        )
+        per_prim = _allocate_frames_by_length(lengths, frames_for_panel)
+        n_drawn = len(drawn)
+        panel_frames: List[Image.Image] = []
+        for prim_idx, primitive in enumerate(drawn):
+            n_frames_p = per_prim[prim_idx] if prim_idx < len(per_prim) else 1
+            hue = 360.0 * prim_idx / max(n_drawn, 1)
+            color = _hsl(hue)
+            for k in range(1, n_frames_p + 1):
+                frame = base.copy()
+                d = ImageDraw.Draw(frame)
+                _draw_partial_primitive(
+                    d,
+                    primitive,
+                    t=k / n_frames_p,
+                    color=color,
+                    stroke_width=stroke_width,
+                    map_pt=map_pt,
+                )
+                panel_frames.append(frame)
+            _draw_partial_primitive(
+                base_draw,
+                primitive,
+                t=1.0,
+                color=color,
+                stroke_width=stroke_width,
+                map_pt=map_pt,
+            )
+        # Hold on final base for any frames remaining.
+        while len(panel_frames) < total_frames:
+            panel_frames.append(base.copy())
+        per_panel_frame_imgs.append(panel_frames[:total_frames])
+
+    # Font for labels. Reuse the truetype-or-bitmap-fallback dance
+    # from the overlay renderer.
+    from PIL import ImageFont
+    font = None
+    for path in (
+        "DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/Library/Fonts/Arial.ttf",
+        "/System/Library/Fonts/Helvetica.ttc",
+    ):
+        try:
+            font = ImageFont.truetype(path, max(8, int(label_height_px * 0.45)))
+            break
+        except (OSError, IOError):
+            continue
+    if font is None:
+        font = ImageFont.load_default()
+
+    combined_frames: List[Image.Image] = []
+    for f_i in range(total_frames):
+        frame = Image.new("RGB", (total_w_px, total_h_px), "white")
+        fdraw = ImageDraw.Draw(frame)
+        for i, panel_imgs in enumerate(per_panel_frame_imgs):
+            x_offset = i * (panel_w_px + panel_gap_px)
+            frame.paste(panel_imgs[f_i], (x_offset, label_height_px))
+            if i > 0:
+                sx = x_offset - panel_gap_px // 2
+                fdraw.line(
+                    [(sx, label_height_px), (sx, total_h_px)],
+                    fill=(220, 220, 220),
+                    width=1,
+                )
+            label = panel_data[i][0]
+            tb = font.getbbox(label)
+            text_w = tb[2] - tb[0]
+            text_h = tb[3] - tb[1]
+            cx = x_offset + panel_w_px // 2 - text_w // 2
+            ty = max(0, (label_height_px - text_h) // 2 - 2)
+            fdraw.text((cx, ty), label, fill=(40, 40, 40), font=font)
+        combined_frames.append(
+            frame.convert(
+                "P",
+                palette=Image.Palette.ADAPTIVE,
+                colors=256,
+                dither=Image.Dither.NONE,
+            )
+        )
+
+    if not combined_frames:
+        combined_frames = [
+            Image.new("RGB", (total_w_px, total_h_px), "white").convert(
+                "P", palette=Image.Palette.ADAPTIVE, colors=256, dither=Image.Dither.NONE,
+            )
+        ]
+
+    frame_ms = max(1, int(round(1000 / max(1, fps))))
+    combined_frames[0].save(
+        output_path,
+        save_all=True,
+        append_images=combined_frames[1:],
         optimize=False,
         duration=frame_ms,
         loop=0,
@@ -824,3 +1122,488 @@ def commands_to_heatmap(
     if output_path is not None:
         img.save(output_path)
     return img
+
+
+# ---------------------------------------------------------------------------
+# Overlay: drawn-stroke geometry on top of the source image
+# ---------------------------------------------------------------------------
+
+
+def _format_command_label(index_1: int, cmd: DrawingCommand) -> str:
+    """One-line text label for a command. Matches the ``"1. Line (4)"``
+    / ``"2. Spin (40deg)"`` shape the README/tests show.
+
+    Pen-up moves are labelled as "Drive" (vs "Line" for pen-down) so
+    transit segments are unambiguously distinguishable from drawn
+    strokes even when reading the label list on its own.
+    """
+    kind = cmd["kind"]
+    if kind == "spin":
+        return f"{index_1}. Spin ({cmd['degrees']:.1f}deg)"
+    if kind == "line":
+        head = "Line" if cmd.get("penDown", False) else "Drive"
+        return f"{index_1}. {head} ({cmd['distance']:.1f})"
+    if kind == "arc":
+        return (
+            f"{index_1}. Arc ({cmd['degrees']:.1f}deg, "
+            f"r={cmd['radius']:.1f})"
+        )
+    return f"{index_1}. {kind}"
+
+
+def _draw_dashed_line(
+    draw: ImageDraw.ImageDraw,
+    p0: Tuple[float, float],
+    p1: Tuple[float, float],
+    fill: Tuple[int, int, int, int],
+    width: int,
+    dash_length: float = 6.0,
+    gap_length: float = 4.0,
+) -> None:
+    """Draw a dashed line from ``p0`` to ``p1`` by stepping along the
+    segment and emitting alternating dash/gap pieces. PIL's ImageDraw
+    has no built-in dash pattern; rolling our own keeps the dependency
+    surface unchanged.
+    """
+    x0, y0 = float(p0[0]), float(p0[1])
+    x1, y1 = float(p1[0]), float(p1[1])
+    dx = x1 - x0
+    dy = y1 - y0
+    length = math.hypot(dx, dy)
+    if length < 1e-3:
+        return
+    ux = dx / length
+    uy = dy / length
+    step = dash_length + gap_length
+    t = 0.0
+    while t < length:
+        end_t = min(t + dash_length, length)
+        sx = x0 + ux * t
+        sy = y0 + uy * t
+        ex = x0 + ux * end_t
+        ey = y0 + uy * end_t
+        draw.line([(sx, sy), (ex, ey)], fill=fill, width=width)
+        t += step
+
+
+def commands_to_overlay(
+    commands: Sequence[DrawingCommand],
+    source: "str | Image.Image | np.ndarray",
+    output_path: Optional[str] = None,
+    start_pos: Tuple[float, float] = (0.0, 0.0),
+    start_heading: float = 0.0,
+    stroke_color: Tuple[int, int, int, int] = (220, 40, 40, 230),
+    transit_color: Tuple[int, int, int, int] = (140, 140, 140, 200),
+    stroke_width: int = 2,
+    transit_width: int = 1,
+    source_alpha: float = 0.35,
+    show_labels: bool = True,
+    label_font_size: int = 14,
+    label_color: Tuple[int, int, int, int] = (30, 60, 160, 255),
+    leader_color: Tuple[int, int, int, int] = (120, 120, 120, 180),
+    label_dot_color: Tuple[int, int, int, int] = (30, 60, 160, 255),
+    label_dot_radius: int = 3,
+):
+    """Render the pen-down geometry of ``commands`` on top of the source
+    image, so you can eyeball how faithfully the vectorization tracks
+    the original strokes.
+
+    The source image is blended toward white at ``source_alpha`` (0 =
+    pure white, 1 = source unchanged) so the colored overlay reads
+    clearly against the faded background. Pen-up moves are not drawn
+    — the overlay is only what physically gets inked.
+
+    When ``show_labels`` is set, each command's starting point is
+    marked and labelled (``"1. Line (4)"``, ``"2. Spin (40deg)"``,
+    …). Labels are stacked in a column to the right of the source
+    image so they can never overlap each other or the geometry,
+    and each label is connected by a thin leader line back to its
+    command's start position in the image.
+
+    Coordinate alignment: the simulator replays the command sequence
+    from ``start_pos`` in the same image coordinates the source image
+    uses, so as long as the same ``start_pos`` / ``start_heading``
+    were passed to the vectorizer (the pipeline defaults to (0, 0) and
+    0 rad), drawn primitives land at the same pixel positions they
+    would in the original source — no scaling or recentering.
+
+    Args:
+        commands: the optimized command sequence (e.g.
+            ``OptimizeRoute(...).commands`` or
+            ``LowGeometryVectorize(...).consolidated``).
+        source: file path / PIL image / numpy array of the source.
+        output_path: optional PNG path to write to.
+        stroke_color: RGBA for the overlay strokes.
+        stroke_width: pen-down line width in source-image pixels.
+        source_alpha: 0–1, how much of the source remains visible. 0.35
+            is enough for the source to read as a faint trace under
+            the overlay without competing for attention.
+        show_labels: include numbered command labels and leader lines.
+        label_font_size: font size for command labels.
+        label_color / leader_color / label_dot_color / label_dot_radius:
+            colors and dot size for the label callouts. Defaults are
+            tuned to read clearly against both the red overlay and
+            the faded source.
+    """
+    drawn, pen_up, _bbox = _simulate(commands, start_pos, start_heading)
+
+    if isinstance(source, str):
+        src = Image.open(source).convert("RGBA")
+    elif isinstance(source, np.ndarray):
+        arr = source
+        if arr.dtype == np.bool_:
+            arr = (arr.astype(np.uint8) * 255)
+        elif arr.dtype != np.uint8:
+            scaled = arr.astype(np.float64)
+            if scaled.max() <= 1.0 + 1e-6:
+                scaled = scaled * 255.0
+            arr = np.clip(scaled, 0, 255).astype(np.uint8)
+        if arr.ndim == 2:
+            src = Image.fromarray(arr).convert("RGBA")
+        else:
+            src = Image.fromarray(arr).convert("RGBA")
+    elif isinstance(source, Image.Image):
+        src = source.convert("RGBA")
+    else:
+        raise TypeError(f"unsupported source type {type(source)!r}")
+
+    # Fade by blending toward white. ``source_alpha`` is the weight on
+    # the source side; the rest is white, so the source visibly fades
+    # while preserving its hue.
+    source_alpha = max(0.0, min(1.0, float(source_alpha)))
+    white = Image.new("RGBA", src.size, (255, 255, 255, 255))
+    base = Image.blend(white, src, source_alpha)
+
+    overlay = Image.new("RGBA", src.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+
+    def _xy(p) -> Tuple[float, float]:
+        return (float(p[0]), float(p[1]))
+
+    # Pen-up transits first, so the pen-down strokes layer cleanly
+    # over them.
+    for p0, p1 in pen_up:
+        _draw_dashed_line(
+            draw,
+            _xy(p0),
+            _xy(p1),
+            fill=transit_color,
+            width=transit_width,
+        )
+
+    for d in drawn:
+        if d["kind"] == "line":
+            draw.line(
+                [_xy(d["p0"]), _xy(d["p1"])],
+                fill=stroke_color,
+                width=stroke_width,
+            )
+        else:  # arc
+            center = d["center"]
+            r = float(d["radius"])
+            sweep = float(d["sweep"])
+            start_a = math.atan2(
+                d["p0"][1] - center[1], d["p0"][0] - center[0]
+            )
+            # Sample density tracks arc length so longer arcs stay
+            # smooth without blowing up cost for tiny ones.
+            n_samp = max(8, int(abs(sweep) * r * 0.5))
+            pts = []
+            for k in range(n_samp + 1):
+                a = start_a + sweep * (k / n_samp)
+                pts.append((
+                    center[0] + r * math.cos(a),
+                    center[1] + r * math.sin(a),
+                ))
+            draw.line(pts, fill=stroke_color, width=stroke_width)
+
+    if not show_labels or not commands:
+        # Channel-separated rendering for the clean (unlabelled) view.
+        # Each input layer is encoded into one RGB channel of the
+        # output image, so you can grab a single layer by reading
+        # that channel — handy for downstream tooling or diffs.
+        #
+        # Channel layout:
+        #   R = rendered strokes  (dark where the bot drew with pen down)
+        #   G = source image      (dark where the source has ink)
+        #   B = transit (pen-up)  (dotted where the bot drove pen-up)
+        #
+        # Combined-visual semantics (handy for spotting where the
+        # vectorization matches or diverges from the source):
+        #   white   = no layer present
+        #   blue    = source AND rendered overlap (✓ faithful)
+        #   magenta = source only (rendered missed this stroke)
+        #   cyan    = rendered only (rendered drew something extra)
+        #   yellow  = transit only
+        #   black   = all three layers overlap
+        src_gray = src.convert("L")
+        src_w, src_h = src.size
+
+        r_channel = Image.new("L", (src_w, src_h), 255)
+        rdraw = ImageDraw.Draw(r_channel)
+        for d in drawn:
+            if d["kind"] == "line":
+                rdraw.line(
+                    [_xy(d["p0"]), _xy(d["p1"])],
+                    fill=0,
+                    width=stroke_width,
+                )
+            else:  # arc
+                center = d["center"]
+                r_ = float(d["radius"])
+                sweep = float(d["sweep"])
+                start_a = math.atan2(
+                    d["p0"][1] - center[1], d["p0"][0] - center[0]
+                )
+                n_samp = max(8, int(abs(sweep) * r_ * 0.5))
+                pts = []
+                for k in range(n_samp + 1):
+                    a = start_a + sweep * (k / n_samp)
+                    pts.append((
+                        center[0] + r_ * math.cos(a),
+                        center[1] + r_ * math.sin(a),
+                    ))
+                rdraw.line(pts, fill=0, width=stroke_width)
+
+        b_channel = Image.new("L", (src_w, src_h), 255)
+        bdraw = ImageDraw.Draw(b_channel)
+        for p0, p1 in pen_up:
+            _draw_dashed_line(
+                bdraw, _xy(p0), _xy(p1), fill=0, width=transit_width,
+            )
+
+        result = Image.merge("RGB", (r_channel, src_gray, b_channel))
+        if output_path is not None:
+            result.save(output_path)
+        return result
+
+    # ----------------------------------------------------------------
+    # Labels: walk the commands a second time and capture each one's
+    # starting (pos, heading) state, then place the labels by
+    # force-directed repulsion so each label ends up as close as
+    # possible to its anchor while not overlapping any other label.
+    # A short leader line ties each label back to a dot drawn at the
+    # command's exact starting point.
+
+    # Walk all commands and label each one (including pen-up
+    # transits, which appear as "Drive (...)" so they're
+    # distinguishable from drawn lines).
+    cmd_starts: List[Tuple[int, str, Tuple[float, float]]] = []
+    pos = np.asarray(start_pos, dtype=float)
+    heading = float(start_heading)
+    for k, cmd in enumerate(commands):
+        cmd_starts.append(
+            (k, _format_command_label(k + 1, cmd), (float(pos[0]), float(pos[1])))
+        )
+        kind = cmd["kind"]
+        if kind == "spin":
+            heading += math.radians(cmd["degrees"])
+        elif kind == "line":
+            d = float(cmd["distance"])
+            pos = pos + d * np.array([math.cos(heading), math.sin(heading)])
+        elif kind == "arc":
+            r = float(cmd["radius"])
+            sweep = math.radians(cmd["degrees"])
+            ccw = sweep > 0.0
+            normal_angle = heading + (math.pi / 2.0 if ccw else -math.pi / 2.0)
+            center = pos + r * np.array([math.cos(normal_angle), math.sin(normal_angle)])
+            start_a = math.atan2(pos[1] - center[1], pos[0] - center[0])
+            end_a = start_a + sweep
+            pos = center + r * np.array([math.cos(end_a), math.sin(end_a)])
+            heading += sweep
+
+    if not cmd_starts:
+        result = Image.alpha_composite(base, overlay).convert("RGB")
+        if output_path is not None:
+            result.save(output_path)
+        return result
+
+    # Try to load a real font so the labels look like text (the PIL
+    # default bitmap font is tiny and unreadable). Fall back if the
+    # truetype isn't available.
+    from PIL import ImageFont
+    font = None
+    for path in (
+        "DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/Library/Fonts/Arial.ttf",
+        "/System/Library/Fonts/Helvetica.ttc",
+    ):
+        try:
+            font = ImageFont.truetype(path, label_font_size)
+            break
+        except (OSError, IOError):
+            continue
+    if font is None:
+        font = ImageFont.load_default()
+
+    label_sizes = np.zeros((len(cmd_starts), 2), dtype=np.float64)
+    for i, (_k, text, _sp) in enumerate(cmd_starts):
+        bbox = font.getbbox(text)
+        label_sizes[i, 0] = (bbox[2] - bbox[0]) + 4  # small horizontal padding
+        label_sizes[i, 1] = (bbox[3] - bbox[1]) + 4
+
+    src_w, src_h = src.size
+    # Extend the canvas so labels in dense areas can spill into a
+    # margin around the source rather than crowd the geometry.
+    label_margin = int(max(label_sizes.max(axis=0)) + 30)
+    canvas_w = src_w + 2 * label_margin
+    canvas_h = src_h + 2 * label_margin
+    offset_x = label_margin
+    offset_y = label_margin
+
+    anchors = np.array(
+        [[sp[0] + offset_x, sp[1] + offset_y] for _k, _t, sp in cmd_starts],
+        dtype=np.float64,
+    )
+
+    # Greedy spiral placement with an outside-the-source preference.
+    # For each label:
+    #   1. Sweep spiral rings around the anchor.
+    #   2. Score each non-overlapping candidate as
+    #        leader_distance + INSIDE_PENALTY (if the label box still
+    #        overlaps the original source image rectangle).
+    #   3. Pick the lowest-scored candidate among a budget of
+    #      ~30 valid candidates found. The penalty is sized so a
+    #      label can drift up to ~``inside_penalty_px`` further
+    #      from its anchor to escape the source image; further than
+    #      that, the leader gets uncomfortably long and we accept
+    #      the inside placement instead.
+    n = len(cmd_starts)
+    ideal_dx = 14.0
+    placed_boxes: List[Tuple[float, float, float, float]] = []
+    final_pos = np.zeros((n, 2), dtype=np.float64)
+
+    def _overlaps_any(x0: float, y0: float, w: float, h: float) -> bool:
+        x1 = x0 + w
+        y1 = y0 + h
+        for bx0, by0, bx1, by1 in placed_boxes:
+            if x1 <= bx0 or x0 >= bx1 or y1 <= by0 or y0 >= by1:
+                continue
+            return True
+        return False
+
+    # Source-image bounds in canvas coordinates (we offset everything
+    # by ``label_margin`` when building the canvas, so the original
+    # image lives inside [margin, margin + src_w/h)).
+    img_left = float(offset_x)
+    img_top = float(offset_y)
+    img_right = float(offset_x + src_w)
+    img_bottom = float(offset_y + src_h)
+
+    # How much extra leader length we'll pay to get a label out of
+    # the source image. ~half the smaller image dimension is a good
+    # balance: anchors near the image's center end up labelled in
+    # the margin (worth the longer leader to keep the source clean),
+    # but anchors deep enough that the *nearest* margin is more than
+    # this many pixels away fall back to an inside placement rather
+    # than dangling a giant leader.
+    inside_penalty_px = max(80.0, 0.45 * min(src_w, src_h))
+
+    def _overlaps_image(x0: float, y0: float, w: float, h: float) -> bool:
+        x1 = x0 + w
+        y1 = y0 + h
+        return not (x1 <= img_left or x0 >= img_right or y1 <= img_top or y0 >= img_bottom)
+
+    margin = 4.0
+    spiral_angles_deg = [0, -25, 25, -55, 55, -90, 90, -120, 120, 180, -150, 150]
+    radius_step = 6.0
+    max_radius = float(max(src_w, src_h)) + 2 * label_margin
+
+    for i, (_k, _text, _sp) in enumerate(cmd_starts):
+        w, h = label_sizes[i]
+        ax, ay = anchors[i]
+        best_xy: Optional[Tuple[float, float]] = None
+        best_score = float("inf")
+        best_is_outside = False
+        radius = 0.0
+        while radius <= max_radius:
+            for ang in spiral_angles_deg:
+                a = math.radians(ang)
+                cx = ax + ideal_dx + radius * math.cos(a)
+                cy = ay + radius * math.sin(a)
+                lx = cx
+                ly = cy - h / 2.0
+                # Clamp into canvas.
+                lx = min(max(margin, lx), canvas_w - w - margin)
+                ly = min(max(margin, ly), canvas_h - h - margin)
+                if _overlaps_any(lx, ly, w, h):
+                    continue
+                box_cx = lx + w / 2.0
+                box_cy = ly + h / 2.0
+                leader = math.hypot(box_cx - ax, box_cy - ay)
+                outside = not _overlaps_image(lx, ly, w, h)
+                score = leader + (0.0 if outside else inside_penalty_px)
+                if score < best_score:
+                    best_score = score
+                    best_xy = (lx, ly)
+                    best_is_outside = outside
+            # Stop once we have an outside-image candidate AND we've
+            # spiralled out far enough that any further candidate is
+            # guaranteed to be worse (its leader length alone now
+            # exceeds the current best score).
+            if best_is_outside and radius > best_score:
+                break
+            radius += radius_step
+        if best_xy is None:
+            best_xy = (ax + ideal_dx, ay - h / 2.0)
+        lx, ly = best_xy
+        final_pos[i] = (lx, ly)
+        placed_boxes.append((lx, ly, lx + w, ly + h))
+
+    label_pos = final_pos
+
+    # Render order (matters):
+    #   1. white canvas
+    #   2. faded source pasted at the source-image area
+    #   3. leader lines drawn on the canvas. They cross into the
+    #      source area, so we want them DRAWN BEFORE the stroke /
+    #      transit overlay so the overlay can paint over them.
+    #      That keeps the dotted transit lines unobscured even when
+    #      a leader runs through the same pixels.
+    #   4. overlay (pen-up dotted transits + pen-down strokes)
+    #      composited on top — covers leaders only where the
+    #      overlay is actually opaque.
+    #   5. translucent label backplates, then text + anchor dots.
+    canvas = Image.new("RGBA", (canvas_w, canvas_h), (255, 255, 255, 255))
+    canvas.paste(base, (offset_x, offset_y))
+
+    cdraw = ImageDraw.Draw(canvas)
+    for i in range(len(cmd_starts)):
+        ax, ay = anchors[i]
+        lx, ly = label_pos[i]
+        lw, lh = label_sizes[i]
+        leader_target = (lx, ly + lh / 2.0)
+        cdraw.line([(ax, ay), leader_target], fill=leader_color, width=1)
+
+    overlay_canvas = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
+    overlay_canvas.paste(overlay, (offset_x, offset_y))
+    canvas = Image.alpha_composite(canvas, overlay_canvas)
+
+    for i, (_k, text, _sp) in enumerate(cmd_starts):
+        lx, ly = label_pos[i]
+        lw, lh = label_sizes[i]
+        # Translucent white plate so the label reads cleanly when it
+        # ends up on top of the source or the red overlay.
+        plate = Image.new(
+            "RGBA", (int(lw), int(lh)), (255, 255, 255, 215)
+        )
+        canvas.alpha_composite(plate, dest=(int(lx), int(ly)))
+
+    cdraw = ImageDraw.Draw(canvas)
+    for i, (_k, text, _sp) in enumerate(cmd_starts):
+        ax, ay = anchors[i]
+        lx, ly = label_pos[i]
+        cdraw.ellipse(
+            [
+                ax - label_dot_radius, ay - label_dot_radius,
+                ax + label_dot_radius, ay + label_dot_radius,
+            ],
+            fill=label_dot_color,
+        )
+        cdraw.text((lx + 2, ly + 2), text, fill=label_color, font=font)
+
+    result = canvas.convert("RGB")
+    if output_path is not None:
+        result.save(output_path)
+    return result

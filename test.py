@@ -11,12 +11,15 @@ from release import (
     HighGeometryVectorize,
     OptimizeRoute,
 )
+from release.auto_config import derive_configs
 from release.visualize import (
     commands_to_heatmap,
+    commands_to_overlay,
     commands_to_svg,
-    commands_to_svg_compare,
-    commands_to_svg_gif,
+    commands_to_svg_compare_n,
+    commands_to_svg_gif_compare_n,
 )
+from release.optimize import estimate_total_time
 
 from visualize.skeletonize import visualize_pipeline
 from visualize.segment import visualize_segments, visualize_fused
@@ -71,14 +74,19 @@ class Visualize:
         suffixes = [
             "skeleton",
             "segments",
-            "fused_geometry",
-            "vectorized",
             "graph",
+            "vectorized",
+            "heatmap",
+            "overlay",
+            "overlay.clean",
+            # Suffixes we used to emit before the cleanup. Kept here
+            # so re-running test.sh against an old examples/ dir
+            # wipes the leftover files.
+            "fused_geometry",
             "commands",
             "optimized",
             "low.vectorized",
             "high.vectorized",
-            "heatmap",
         ]
         for example in examples:
             for suffix in suffixes:
@@ -126,51 +134,30 @@ class Visualize:
         cls,
         low: LowGeometryVectorize,
         high: HighGeometryVectorize,
-        name: str,
-        start_pos: NDArray,
-        start_heading: float,
-    ):
-        commands_to_svg_compare(
-            low.consolidated,
-            high.commands,
-            f"examples/{name}.vectorized.svg",
-            start_pos=start_pos,
-            start_heading=start_heading,
-        )
-        commands_to_svg_gif(
-            low.consolidated,
-            f"examples/{name}.low.vectorized.gif",
-            start_pos=(start_pos[0], start_pos[1]),
-            start_heading=start_heading,
-        )
-        commands_to_svg_gif(
-            high.commands,
-            f"examples/{name}.high.vectorized.gif",
-            start_pos=(start_pos[0], start_pos[1]),
-            start_heading=start_heading,
-        )
-
-    @classmethod
-    def optimized(
-        cls,
-        low: LowGeometryVectorize,
         optimized: OptimizeRoute,
         name: str,
         start_pos: NDArray,
         start_heading: float,
     ):
-        commands_to_svg_compare(
-            low.consolidated,
-            optimized.commands,
-            f"examples/{name}.optimized.svg",
-            label_a=f"before ({optimized.estimated_time_before:.2f}s)",
-            label_b=f"after ({optimized.estimated_time_after:.2f}s)",
+        # One static SVG and one animated GIF, each as a 3-panel
+        # side-by-side comparison of high vs low vs optimized
+        # geometry. The label above each panel encodes the panel's
+        # name and its estimated firmware drawing time.
+        high_time = estimate_total_time(high.commands)
+        panels = [
+            (high.commands, f"high ({high_time:.2f}s)"),
+            (low.consolidated, f"low ({optimized.estimated_time_before:.2f}s)"),
+            (optimized.commands, f"optimized ({optimized.estimated_time_after:.2f}s)"),
+        ]
+        commands_to_svg_compare_n(
+            panels,
+            f"examples/{name}.vectorized.svg",
             start_pos=start_pos,
             start_heading=start_heading,
         )
-        commands_to_svg_gif(
-            optimized.commands,
-            f"examples/{name}.optimized.gif",
+        commands_to_svg_gif_compare_n(
+            panels,
+            f"examples/{name}.vectorized.gif",
             start_pos=(start_pos[0], start_pos[1]),
             start_heading=start_heading,
         )
@@ -188,6 +175,39 @@ class Visualize:
             f"examples/{name}.heatmap.png",
             start_pos=(start_pos[0], start_pos[1]),
             start_heading=start_heading,
+        )
+
+    @classmethod
+    def overlay(
+        cls,
+        optimized: OptimizeRoute,
+        name: str,
+        start_pos: NDArray,
+        start_heading: float,
+    ):
+        # Produce two overlays:
+        #   .overlay.png        — labels + leader lines + Drive/Line/Spin/Arc text.
+        #                         The diagnostic-rich view for understanding what
+        #                         the robot does step by step.
+        #   .overlay.clean.png  — no labels. Just the faded source with the
+        #                         red pen-down strokes and dotted transit lines
+        #                         on top. The "how faithful is the vectorization"
+        #                         view at a glance.
+        commands_to_overlay(
+            optimized.commands,
+            f"examples/{name}.png",
+            f"examples/{name}.overlay.png",
+            start_pos=(start_pos[0], start_pos[1]),
+            start_heading=start_heading,
+            show_labels=True,
+        )
+        commands_to_overlay(
+            optimized.commands,
+            f"examples/{name}.png",
+            f"examples/{name}.overlay.clean.png",
+            start_pos=(start_pos[0], start_pos[1]),
+            start_heading=start_heading,
+            show_labels=False,
         )
 
 
@@ -213,65 +233,32 @@ def process_example(example: str) -> str:
     """
     timings = []
 
+    # Derive every numerical tolerance from the input image's stroke
+    # width so the pipeline doesn't need a per-image tuning pass — see
+    # release/auto_config.py for the scaling rules.
+    image_path = f"examples/{example}.png"
+    cfg = derive_configs(image_path)
+
     with step(timings, "skeletonize"):
         skeleton = Skeletonize(
-            f"examples/{example}.png",
-            Skeletonize.Config.Binarize(threshold=0.5),
-            Skeletonize.Config.Skeletonize(method="zhang"),
-            Skeletonize.Config.Collapse(
-                skeletonize_method="lee",
-                max_hole_area=10,
-                max_thin_thickness=3.0,
-                reskeletonize=True,
-            ),
-            detect_config={
-                "local_tau_radius": 40,
-                "fat_ratio": 1.3,
-                "min_fat_area": 8,
-                "group_dilate": 15,
-                "skel_ring_dilate": 5,
-                "pairing_tangent_steps": 8,
-                "pairing_threshold": 1.2,
-                "min_chromosome_skel_length": 15,
-            },
+            image_path,
+            Skeletonize.Config.Binarize(**cfg["binarize"]),
+            Skeletonize.Config.Skeletonize(**cfg["skeletonize"]),
+            Skeletonize.Config.Collapse(**cfg["collapse"]),
+            detect_config=cfg["detect"],
         )
 
     with step(timings, "viz.skeleton"):
         Visualize.skeleton(skeleton, example)
 
-    junction_tol = 2.5
-    tangent_sample = 10
-
     with step(timings, "segment"):
         segment = Segment(
             skeleton.uncrossed,
             skeleton.binary,
-            Segment.Config.Segment(min_length=10.0),
-            Segment.Config.Fuse(
-                max_path_length=20,
-                lookback=10,
-                min_tangent_score=0.5,
-                gap_penalty=0.05,
-                curvature_penalty=3.0,
-            ),
-            Segment.Config.Repair(
-                junction_tol=junction_tol,
-                stable_skip=2,
-                stable_sample=6,
-                max_junction_region_length=20,
-                min_output_polyline_length=2,
-                min_tangent_spread_deg=15.0,
-                interp_max_spacing=1.0,
-                min_curvature_spike_ratio=2.0,
-                curvature_context_window=8,
-            ),
-            Segment.Config.PostRepairFuse(
-                junction_tol=junction_tol,
-                tangent_skip=2,
-                tangent_sample=tangent_sample,
-                min_tangent_score=0.6,
-                curvature_penalty=1.0,
-            ),
+            Segment.Config.Segment(**cfg["segment"]),
+            Segment.Config.Fuse(**cfg["fuse"]),
+            Segment.Config.Repair(**cfg["repair"]),
+            Segment.Config.PostRepairFuse(**cfg["post_repair_fuse"]),
         )
 
     with step(timings, "viz.segments"):
@@ -280,15 +267,7 @@ def process_example(example: str) -> str:
     with step(timings, "graph"):
         graph = StrokeGraph(
             segment.fused_post_repair,
-            StrokeGraph.Config.Build(
-                junction_tol=junction_tol,
-                terminal_tangent_window=10,
-                crossing_tangent_skip=2,
-                crossing_tangent_half_window=6,
-                cusp_angle_threshold_deg=50.0,
-                cluster_merge_centroid_distance=10.0,
-                cluster_merge_index_gap=10,
-            ),
+            StrokeGraph.Config.Build(**cfg["graph_build"]),
         )
 
     with step(timings, "viz.graph"):
@@ -314,37 +293,8 @@ def process_example(example: str) -> str:
             segment.fused_post_repair,
             start_pos=start_pos,
             start_heading=start_heading,
-            commands=HighGeometryVectorize.Config.ToCommands(
-                sigma=2.0,
-                corner_threshold=0.25,
-                max_fit_residual=5.0,
-            ),
-            consolidate=HighGeometryVectorize.Config.Consolidate(
-                center_tol_rel=0.25,
-                radius_tol_rel=0.25,
-                center_tol_abs=3.0,
-                radius_tol_abs=3.0,
-                max_endpoint_snap_rel=0.15,
-                max_endpoint_snap_abs=6.0,
-                proximity_min_radius_ratio=0.4,
-                line_angle_tol_deg=6.0,
-                line_offset_tol_abs=5.0,
-                min_line_length=5.0,
-                max_line_endpoint_snap_abs=5.0,
-                junction_epsilon=3.0,
-                merge_arcs=True,
-                merge_lines=True,
-                return_report=False,
-            ),
-        )
-
-    with step(timings, "viz.vectorized"):
-        Visualize.vectorized(
-            low_geometry,
-            high_geometry,
-            example,
-            start_pos=start_pos,
-            start_heading=start_heading,
+            commands=HighGeometryVectorize.Config.ToCommands(**cfg["high_geometry_commands"]),
+            consolidate=HighGeometryVectorize.Config.Consolidate(**cfg["high_geometry_consolidate"]),
         )
 
     with step(timings, "optimize"):
@@ -352,18 +302,18 @@ def process_example(example: str) -> str:
             low_geometry.consolidated,
             start_pos=start_pos,
             start_heading=start_heading,
-            cfg=OptimizeRoute.Config.Optimize(
-                pixels_per_inch=1.0,
-                pen_up_join_tol=0.5,
-                two_opt_passes=16,
-                or_opt_passes=8,
-                or_opt_max_segment_len=3,
-            ),
+            cfg=OptimizeRoute.Config.Optimize(**cfg["optimize_route"]),
         )
 
-    with step(timings, "viz.optimized"):
-        Visualize.optimized(
+    with step(timings, "viz.vectorized"):
+        # 3-panel comparison (high / low / optimized) in both SVG
+        # (static, per-panel labelled with drawing time) and GIF
+        # (synchronised side-by-side animation). This single step
+        # replaces the previous per-mode .vectorized.gif /
+        # .optimized.svg / .optimized.gif outputs.
+        Visualize.vectorized(
             low_geometry,
+            high_geometry,
             optimized,
             example,
             start_pos=start_pos,
@@ -372,6 +322,14 @@ def process_example(example: str) -> str:
 
     with step(timings, "viz.heatmap"):
         Visualize.heatmap(
+            optimized,
+            example,
+            start_pos=start_pos,
+            start_heading=start_heading,
+        )
+
+    with step(timings, "viz.overlay"):
+        Visualize.overlay(
             optimized,
             example,
             start_pos=start_pos,
