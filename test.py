@@ -12,6 +12,7 @@ from release import (
     OptimizeRoute,
 )
 from release.visualize import (
+    commands_to_heatmap,
     commands_to_svg,
     commands_to_svg_compare,
     commands_to_svg_gif,
@@ -77,6 +78,7 @@ class Visualize:
             "optimized",
             "low.vectorized",
             "high.vectorized",
+            "heatmap",
         ]
         for example in examples:
             for suffix in suffixes:
@@ -169,6 +171,21 @@ class Visualize:
         commands_to_svg_gif(
             optimized.commands,
             f"examples/{name}.optimized.gif",
+            start_pos=(start_pos[0], start_pos[1]),
+            start_heading=start_heading,
+        )
+
+    @classmethod
+    def heatmap(
+        cls,
+        optimized: OptimizeRoute,
+        name: str,
+        start_pos: NDArray,
+        start_heading: float,
+    ):
+        commands_to_heatmap(
+            optimized.commands,
+            f"examples/{name}.heatmap.png",
             start_pos=(start_pos[0], start_pos[1]),
             start_heading=start_heading,
         )
@@ -347,6 +364,14 @@ def process_example(example: str) -> str:
     with step(timings, "viz.optimized"):
         Visualize.optimized(
             low_geometry,
+            optimized,
+            example,
+            start_pos=start_pos,
+            start_heading=start_heading,
+        )
+
+    with step(timings, "viz.heatmap"):
+        Visualize.heatmap(
             optimized,
             example,
             start_pos=start_pos,
