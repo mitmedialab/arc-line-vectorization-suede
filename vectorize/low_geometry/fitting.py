@@ -543,7 +543,15 @@ def fit_segment_topdown(
         worst = int(np.argmax(res))
         worst += lo
         worst = max(lo + min_len, min(hi - min_len, worst))
-        if worst <= lo or worst >= hi:
+        # BOTH children must have a strictly smaller window than this
+        # one, otherwise we'd recurse on the same range until ``depth``
+        # hits ``max_depth`` and the forced-terminal branch fires —
+        # producing a chain of degenerate L(0) pieces, one per depth
+        # level (angel poly 10 produced 10+ identical 1-point pieces
+        # this way). The first child is ``recurse(lo, worst + 1)``, so
+        # ``worst + 1 < hi`` keeps it strictly smaller. ``worst > lo``
+        # keeps the second child strictly smaller.
+        if worst <= lo or worst + 1 >= hi:
             # Couldn't find a valid split; accept the whole window as-is.
             prim = line
             pieces.append(ChainPiece(lo, hi, prim))
@@ -742,6 +750,78 @@ def find_closed_subloop(
     return None
 
 
+def _is_degenerate(prim: Primitive) -> bool:
+    """A primitive is degenerate if it represents essentially no
+    geometry — a near-zero-length Line, or an Arc with near-zero sweep.
+    Emitting one as a command costs an alignment spin and a
+    line/arc op for no visible drawing.
+    """
+    if isinstance(prim, Line):
+        return prim.length() < 0.5
+    if isinstance(prim, Arc):
+        return abs(prim.sweep()) < math.radians(0.5)
+    return False
+
+
+def _drop_degenerate_pieces(
+    pieces: List[ChainPiece],
+    source_points: List[NDArray[np.float64]],
+    primitives: List[Primitive],
+) -> Tuple[List[ChainPiece], List[NDArray[np.float64]], List[Primitive]]:
+    """Strip degenerate primitives from a chain, folding their source
+    points into the nearest live neighbor's source-point bag so the
+    polyline coverage is preserved (and the subsequent greedy fusion
+    can refit the neighbor against the full data).
+
+    A degenerate at chain index ``k`` is folded into the previous live
+    piece when one exists, otherwise into the next live piece. If the
+    entire chain is degenerate (unlikely), an empty chain is returned;
+    the caller treats that as "nothing to route".
+    """
+    out_pieces: List[ChainPiece] = []
+    out_src: List[NDArray[np.float64]] = []
+    out_prims: List[Primitive] = []
+    pending_src: List[NDArray[np.float64]] = []  # for degenerates at chain start
+    pending_start: int = -1
+
+    for k, prim in enumerate(primitives):
+        if _is_degenerate(prim):
+            if out_pieces:
+                # Fold into the previous live piece by extending its
+                # end index and concatenating source points.
+                last = out_pieces[-1]
+                out_pieces[-1] = ChainPiece(
+                    last.start_idx, pieces[k].end_idx, last.primitive
+                )
+                out_src[-1] = np.vstack([out_src[-1], source_points[k]])
+            else:
+                # No previous live piece yet — buffer for the next one.
+                if pending_start < 0:
+                    pending_start = pieces[k].start_idx
+                pending_src.append(source_points[k])
+            continue
+
+        # Live piece: absorb any pending pre-chain degenerates.
+        if pending_src:
+            src = np.vstack(pending_src + [source_points[k]])
+            new_piece = ChainPiece(
+                pending_start, pieces[k].end_idx, prim
+            )
+            pending_src = []
+            pending_start = -1
+        else:
+            src = source_points[k]
+            new_piece = pieces[k]
+        out_pieces.append(new_piece)
+        out_src.append(src)
+        out_prims.append(prim)
+
+    # If the chain ended in degenerates with no prior live piece (and
+    # nothing followed), we drop them entirely — there's no valid
+    # primitive to attach them to.
+    return out_pieces, out_src, out_prims
+
+
 def fuse_chain(
     pieces: List[ChainPiece],
     source_points: List[NDArray[np.float64]],
@@ -780,6 +860,19 @@ def fuse_chain(
     responsible for rebuilding the global primitive list and primitive-
     id mapping (typically via ``assign_global_ids``).
     """
+    # Phase 0: swallow degenerate pieces. A "Line" with chord < 0.5 px
+    # or an "Arc" with sweep < 0.5 degrees is a fit to ~1 source point
+    # — it represents no real geometry but costs a spin and a
+    # `{"distance": 0, "penDown": true}` command in the output stream
+    # (the angel example had 16 such pieces from a recursion bug in
+    # chain subdivision; even after fixing that, the joint solver and
+    # other paths can still produce occasional degenerates, so we
+    # filter here defensively). Each degenerate's source points are
+    # appended to the previous live piece's source points so the
+    # subsequent greedy fusion has the full polyline context.
+    pieces, source_points, primitives = _drop_degenerate_pieces(
+        pieces, source_points, primitives
+    )
     n = len(pieces)
     if n <= 1:
         # Rewrap the single piece around its current primitive (which
