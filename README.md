@@ -96,10 +96,12 @@ The stages:
  PNG
   │
   ▼
-[1] Skeletonize   binarize → thin to 1-px centerline → resolve crossings
+[1] Skeletonize   binarize → thin → resolve filled shapes → resolve crossings
+  │               also: assign every binary pixel to a final-skeleton pixel
   │
   ▼
 [2] Segment       trace polylines → fuse → repair junctions → fuse
+  │               also: label every final-polyline pixel with a raw-segment id
   │
   ▼
 [3] Graph         endpoints → vertices, polylines → edges
@@ -107,6 +109,7 @@ The stages:
   ▼
 [4] Vectorize     fit Lines / Arcs / Circles to each polyline
   │   ├── low geometry   the real pipeline (joint constraint solve)
+  │   │                  also: label every drawing command with raw-segment spans
   │   └── high geometry  a deliberately naive baseline for comparison
   ▼
 [5] Route optimize  re-sequence primitives to minimize draw time
@@ -124,6 +127,12 @@ A useful mental model: stages 1–3 are computer-vision/graph work and
 are largely about robustness to messy input; stage 4 is geometric
 fitting and optimization; stage 5 is a routing/TSP problem.
 
+Stages 1, 2, and 4 each emit a **labeling** alongside their primary
+output that points each downstream artifact back to where it came
+from — see §9 for the end-to-end story. The labels are what let you
+answer "this pixel of the original drawing became this drawing
+command" without having to re-derive it from the geometry.
+
 ---
 
 ## 3. Stage 1 — Skeletonize  (`release/skeletonize/`)
@@ -133,11 +142,45 @@ Goal: reduce fat hand-drawn strokes to clean 1-pixel-wide centerlines.
 `cleanup.py` binarizes the image and applies morphological thinning.
 The result is a skeleton: every stroke becomes a 1-px-wide path.
 
-The hard part is **crossings** (`crossings.py`). When two strokes
-briefly share ink — an X, a T, a place where the pen doubled back —
-thinning cannot tell them apart and collapses the overlap into a
-single `)(`-shaped centerline. Naively tracing that produces wrong
-topology.
+### 3.1 Filled shapes  (`eyes.py`)
+
+Morphological thinning collapses a hand-drawn filled disk (a pupil, a
+dot) to a single pixel or a tight 2–5 pixel cluster. Downstream
+segmentation either drops it as a sub-minimum-length polyline or
+hands it on as a degenerate "stroke" the vectorizer can't reasonably
+fit; the visual intent is lost. `eyes.py` runs after the cleaned
+skeleton is available, finds each filled connected component, and
+**replaces the collapsed medial-axis skeleton with the region's
+1-pixel outer boundary** — a closed loop the segmenter then traces
+cleanly and the vectorizer fits as a `Circle`.
+
+Detection combines two signals per 8-connected component, applied to
+the binary mask:
+
+- ``skeleton_pixels <= max_skeleton_pixels`` — a filled disk's medial
+  axis collapses to a few pixels; a normal stroke has one skeleton
+  pixel per pixel of length and easily exceeds this even for short
+  strokes.
+- ``area / skeleton_pixels >= min_fill_ratio`` — a stroke has
+  ``area / skel ≈ stroke_width`` (each skeleton pixel covers one
+  column across the stroke), so a ratio threshold a few times larger
+  than stroke width cleanly separates fills (10–50×) from strokes
+  (~3–5×).
+
+Both gates are needed: skeleton count alone catches short stroke
+fragments (a tick mark); ratio alone catches any sufficiently fat
+blob. Resolution wipes the interior skeleton pixels and writes back
+the morphological-gradient ring re-skeletonized to one pixel wide —
+that re-thinning matters, because the raw ring picks up 2-pixel
+shoulders on irregular hand-drawn fills which would fragment the
+trace into tiny pieces the min-length filter then drops.
+
+### 3.2 Crossings  (`crossings.py`)
+
+The other hard part is **crossings**. When two strokes briefly share
+ink — an X, a T, a place where the pen doubled back — thinning
+cannot tell them apart and collapses the overlap into a single
+`)(`-shaped centerline. Naively tracing that produces wrong topology.
 
 The crossing/"chromosome" resolver detects these with several
 independent signals rather than one fragile threshold:
@@ -153,9 +196,33 @@ Where a real crossing is found, the resolver erases the dilated blob
 and redraws two clean Bresenham strokes between the paired arm
 endpoints, restoring the true topology.
 
-Output fields: `binary` (the filled stroke mask), `skeletonized` (the
-raw 1-px skeleton), `uncrossed`/`collapsed` (after crossing
-resolution — `collapsed` is what stage 2 consumes).
+### 3.3 Pixel-to-skeleton labeling  (`labeling.py`)
+
+Once the final skeleton (`uncrossed`) is settled, every binary pixel
+is assigned to its associated skeleton pixel by **geodesic flooding
+through the stroke mask**, implemented as one
+`skimage.segmentation.watershed` call with a flat elevation and one
+marker per skeleton pixel. With a flat elevation, watershed
+degenerates to multi-source BFS that assigns every reachable pixel to
+the nearest marker by in-stroke distance. Two arms meeting at a
+junction therefore partition the surrounding ink along the actual
+stroke topology rather than along a Euclidean perpendicular bisector
+that can leak across junctions on thick ink. Skimage's thinning
+doesn't expose which pixel was absorbed into which surviving pixel,
+so we recover the mapping after the fact.
+
+The output `labeling` is an `(H, W)` `int32` array; pixels outside
+the binary mask hold `-1`. See §9 for how downstream stages use it.
+
+### 3.4 Output fields
+
+`binary` (the filled stroke mask), `skeletonized` (the raw 1-px
+skeleton), `collapsed` (small-hole cleanup), `eye_detection` (the
+`EyeDetectResult` listing each filled region), `eyes_resolved` (the
+skeleton with filled regions replaced by their boundary rings),
+`detection` (the crossing detection), `uncrossed` (the final
+skeleton — what stage 2 consumes), `labeling` (the per-binary-pixel
+back-pointer to a skeleton pixel).
 
 ---
 
@@ -194,6 +261,34 @@ grown outward while `|r''|` stays elevated.
 Relevant config lives in `RepairConfig`; the cascade-merge parameters
 (`cascade_gap`, an index gap, and `cascade_max_jp_distance`, a pixel
 distance) decide when two adjacent repairs on one polyline are merged.
+
+### 4.1 Raw-segment labeling  (`labels.py`)
+
+Every pixel of every final polyline (post-fuse-post-repair-post-fuse)
+carries the id of the raw `trace.py`-output segment it came from.
+The labels are exposed as `Segment.labeled_segments`, where each
+entry pairs the final polyline with a tiled list of `RawSegmentSpan`
+runs whose union exactly equals the polyline.
+
+The mapping is recovered after the fact by **KDTree nearest-neighbour
+lookup** through every raw-segment pixel, then compressing
+consecutive same-id pixels into spans. This works because the
+fuse/repair/post-fuse cascade moves pixels by at most
+O(stroke-width) — fusion bridges hug ink between joined endpoints,
+and repair's LS-solved junction point sits within the original
+cluster — so each new pixel's nearest raw pixel is in the raw segment
+that semantically owns it. Maintaining labels through every
+concatenation/splice in the cascade would have been invasive; the
+after-the-fact lookup is one KDTree build and one query per final
+polyline.
+
+Each `RawSegmentSpan` exposes both a half-open final-polyline range
+(`start`, `end`) AND an inclusive raw-segment range (`raw_start`,
+`raw_end`). The raw range is inclusive on both ends because a reverse
+traversal (fusion can splice a raw segment in either direction) would
+otherwise land at `raw_end = -1` when ending at raw index 0 —
+indistinguishable from Python's "all but last" slice sentinel.
+`raw_end < raw_start` therefore unambiguously encodes a reverse walk.
 
 ---
 
@@ -389,6 +484,53 @@ commands_consolidated   primitives_consolidated   tour_consolidated
 output; `commands_fitted` is the pre-beautification snapshot kept for
 diagnostics.
 
+### 6.7 Per-command raw-segment labels  (`labels.py`)
+
+When the vectorizer is built with `labeled_segments=segment.labeled_segments`,
+it produces `labeled_commands_consolidated` — one `LabeledCommand` per
+emitted command. Drawing commands (pen-down line / arc / circle) carry
+a list of `CommandSpan` runs naming the raw segments their primitive
+came from; spins and pen-up transit commands carry an empty span list.
+
+Each `CommandSpan` has:
+
+- `raw_segment_id` — pointer back to `Segment.segments`.
+- `raw_start`, `raw_end` — inclusive indices in the raw segment;
+  `raw_end < raw_start` means the command walks the raw segment in
+  reverse (whenever the tour traverses a primitive end → start).
+- `command_start_ratio`, `command_end_ratio` — fraction along the
+  command's geometry (0 at the command's start, 1 at its end), so
+  callers can map ratio → spatial position via the command's primitive.
+
+The link is rebuilt in three hops, each contained in `labels.py`:
+
+1. **command → primitive.** Replay `to_commands`'s control flow to
+   find the last command emitted per tour entry — that's the drawing
+   command. Spins and pen-ups are emitted before it, by construction.
+2. **primitive → final-polyline range.** Each primitive came from one
+   `ChainPiece` carrying `start_idx` / `end_idx` into the *subsampled*
+   polyline `fit_polyline` saw. `build_chains` applies a deterministic
+   `np.linspace` subsample at `polyline_subsample_cap`; we recompute
+   it here to map subsampled indices back to raw (= final-segment)
+   indices.
+3. **final-polyline range → raw-segment spans.** The segment stage's
+   `LabeledSegment` carries per-pixel `raw_ids` / `raw_indices`, so we
+   walk the relevant pixel range and compress consecutive same-id
+   pixels into command spans. Each run's endpoints get projected onto
+   the primitive geometry (analytic projection for `Line`/`Arc`/
+   `Circle`) for the ratio fields.
+
+Most raw segments are wholly consumed by one primitive and yield
+exactly one `CommandSpan` covering `raw[0:len]` and ratio
+`[0.0, 1.0]`; spans that don't cover a full raw segment fall out of
+the same code path when a primitive consumed only part of a raw
+segment (a corner split mid-stroke).
+
+Important scope note: labels are produced for `commands_consolidated`
+only. `OptimizeRoute` (stage 5) reorders commands and re-emits transit
+spins/lines, so its `commands` output is **not** labeled — the labels
+are tied to the consolidated tour the labeler walked.
+
 ---
 
 ## 7. Stage 5 — Route optimization  (`release/optimize.py`)
@@ -488,7 +630,69 @@ regressing.
 
 ---
 
-## 9. Auto-configuration  (`release/auto_config.py`)
+## 9. Cross-stage labeling — pixel ↔ command
+
+Three stages emit a labeling alongside their primary output so the
+pipeline can answer "which drawing command does this source pixel
+become?" without re-deriving it from geometry. The chain is:
+
+```
+binary pixel  →  skeleton pixel  →  raw segment id  →  final segment span  →  drawing command
+                 (§3.3)            (§4.1)            (§4.1)                 (§6.7)
+```
+
+Each hop is implemented independently and exposes its lookup
+artifact, so downstream callers can stitch them together at whatever
+granularity they need:
+
+| Hop | Stage | Artifact | Where |
+|-----|-------|----------|-------|
+| binary pixel → skeleton pixel | Skeletonize | `labeling: (H, W) int32` (-1 = outside binary) | `Skeletonize.labeling` |
+| skeleton/final pixel → raw segment id (+ index, + raw range) | Segment | `labeled_segments: List[LabeledSegment]` with per-pixel `raw_ids`/`raw_indices` and run-compressed `RawSegmentSpan` lists | `Segment.labeled_segments` |
+| drawing command → raw segment id (+ index, + ratio) | Vectorize | `labeled_commands_consolidated: List[LabeledCommand]` with per-command `CommandSpan` lists | `LowGeometryVectorize.labeled_commands_consolidated` |
+
+Walking forward: a binary pixel `(y, x)` lands on
+`Skeletonize.labeling[y, x]`, a row-major flat index into the True
+pixels of the final skeleton. That skeleton pixel's image position
+appears inside one of the final-polyline points; the segment-stage's
+`raw_ids[i]` / `raw_indices[i]` tell you which raw `trace.py`
+polyline (and which index in it) the final point was credited to;
+the vectorize-stage's `CommandSpan` whose `[raw_start, raw_end]`
+brackets that raw index gives the drawing command and its
+`command_start_ratio` / `command_end_ratio` window.
+
+Walking backward (from a command to source pixels) is the same chain
+in reverse. Use this for diagnostics ("why is this part of the
+drawing missing?") or for source-color-preserving renderings ("paint
+each command in the colour of the source pixels it covers").
+
+Each stage also ships a debug visualization in `release/visualize.py`
+that uses a golden-ratio hue palette with adjacency-contrast
+renumbering, so neighbouring labels always land at well-separated
+hues. The visualizations are saved as `examples/<name>.<stage>.labeling.png`
+by the test harness — see §11.
+
+Scope limits worth knowing:
+
+- The skeleton-pixel mapping is *geodesic-via-watershed*, not
+  Euclidean. Two arms meeting at a junction partition their
+  surrounding ink along the actual stroke topology rather than along
+  a Euclidean perpendicular bisector that can leak across junctions
+  on thick ink.
+- The segment-stage mapping is *nearest-neighbour-via-KDTree*. It
+  exploits that the fuse/repair/post-fuse cascade moves pixels by at
+  most O(stroke-width), which is true for every transformation in
+  the cascade — fusion bridges hug ink between the joined endpoints,
+  and repair's LS-solved junction point sits within the original
+  cluster.
+- Command labels are produced for `commands_consolidated` only;
+  `OptimizeRoute` reorders commands and re-emits transit
+  spins/lines, so its `commands` output is not labeled. Re-running
+  the labeler against the optimized tour would close that gap.
+
+---
+
+## 10. Auto-configuration  (`release/auto_config.py`)
 
 There is no per-image tuning. `derive_configs(source)` measures one
 quantity — the characteristic **stroke width**, estimated as twice the
@@ -530,7 +734,7 @@ about whether scaling is right for it.
 
 ---
 
-## 10. Repository layout
+## 11. Repository layout
 
 ```
 release/
@@ -543,11 +747,14 @@ release/
 
   skeletonize/         stage 1
     cleanup.py           binarize + thinning
+    eyes.py              filled-shape detection; swap medial axis for boundary
     crossings.py         crossing / chromosome detection and resolution
+    labeling.py          binary pixel → skeleton pixel (geodesic watershed)
   segment/             stage 2
-    trace.py             skeleton bitmap → polylines
+    trace.py             skeleton bitmap → polylines (raw segments)
     fusion.py            join fragments of the same stroke (A* + tangents)
     repair.py            curvature-gated junction reconstruction
+    labels.py            final-polyline pixel → raw segment id (KDTree)
   graph/               stage 3 — StrokeGraph (endpoints→vertices)
   vectorize/
     low_geometry/      stage 4, the real path
@@ -558,6 +765,7 @@ release/
       beautify.py        detect near-relations; merge arcs into circles
       manifest.py        constraint bundle types
       routing.py         Eulerian / Chinese-Postman ordering
+      labels.py          drawing command → raw segment spans (+ ratios)
     high_geometry/     stage 4, the naive comparison baseline
 
 test.py                runs every example end to end, prints metrics
@@ -567,7 +775,7 @@ tests/                 unit tests (geometry + simulator sanity checks)
 
 ---
 
-## 11. Running it
+## 12. Running it
 
 ```sh
 ./test.sh
@@ -590,14 +798,38 @@ skeleton, segment, graph, low, high, opt_low, opt_high = \
     default_pipeline("examples/smile.png")
 print(opt_low.commands)               # the robot command stream
 print(opt_low.estimated_time_after)   # estimated draw time (s)
+
+# Cross-stage labels (see §9):
+print(skeleton.labeling.shape)                       # (H, W) int32 per-pixel
+print(segment.labeled_segments[0].spans)             # raw-segment runs
+print(low.labeled_commands_consolidated[0].spans)    # raw-segment per command
 ```
 
 A single example processes in ~10–15 s; the full suite takes several
 minutes. `test.py` parallelizes with a memory-aware worker cap.
 
+For each example the harness writes a set of debug PNGs into
+`examples/`:
+
+| Filename | Stage | Content |
+|----------|-------|---------|
+| `<name>.skeleton.png` | 1 | binary, cleaned skeleton, eye detection, eye-resolved skeleton, crossing detection, final skeleton (6-panel) |
+| `<name>.skeleton.labeling.png` | 1 | every binary pixel coloured by its skeleton-pixel label (§3.3) |
+| `<name>.segments.png` | 2 | per-stage segment renders (trace, fused, repaired, post-repair fused) |
+| `<name>.segments.labeling.png` | 2 | every final-polyline span coloured by its raw-segment id (§4.1) |
+| `<name>.graph.png` | 3 | stroke graph with vertices and edges |
+| `<name>.vectorized.svg` | 4 | high / low / optimized 3-panel comparison |
+| `<name>.commands.labeling.png` | 4 | every drawing command coloured by its raw-segment-span ids (§6.7) |
+| `<name>.heatmap.png`, `<name>.overlay.png`, `<name>.overlay.clean.png` | 5–6 | firmware-time heatmap and source-image overlays |
+
+Adjacent labels in the three `*.labeling.png` renders always land at
+well-separated hues (golden-ratio palette + stride renumbering), so
+an over-merge shows as a single colour where two would be expected
+and an over-split shows as a hue jump inside one continuous run.
+
 ---
 
-## 12. Conventions and gotchas for contributors
+## 13. Conventions and gotchas for contributors
 
 - **Coordinate frame.** Image space `(x, y)`, x right, y down. `trace.py`
   works in `(row, col)` = `(y, x)` internally and converts at its
@@ -626,10 +858,24 @@ minutes. `test.py` parallelizes with a memory-aware worker cap.
   recompute, then flip it back.
 - **Most thresholds belong in `auto_config.py`.** A hardcoded pixel
   distance inside a function silently breaks scale-invariance.
+- **Labeled spans use mixed conventions.** Final-polyline `start`/`end`
+  on `RawSegmentSpan` are half-open (Python slice). Raw-segment
+  `raw_start`/`raw_end` on `RawSegmentSpan` *and* `CommandSpan` are
+  inclusive on both ends. The inclusive convention is deliberate:
+  a half-open reverse walk ending at raw index 0 would land at
+  `raw_end = -1`, which is indistinguishable from Python's
+  "all but last" slice sentinel. To slice the raw segment regardless
+  of direction, use
+  `raw_segments[id][min(raw_start, raw_end) : max(raw_start, raw_end) + 1]`.
+- **`OptimizeRoute` invalidates command labels.** Stage 5 reorders
+  primitives and re-emits transit commands, so its `commands` output
+  is unlabeled. Use `low.labeled_commands_consolidated` (against
+  `low.commands_consolidated`) if you need labels; re-label the
+  optimized tour if you need labels on the post-optimization output.
 
 ---
 
-## 13. Appendix — key formulas
+## 14. Appendix — key formulas
 
 **Arc geometry.** For an arc of radius `r` and signed sweep `θ`:
 
