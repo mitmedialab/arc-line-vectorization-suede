@@ -484,13 +484,21 @@ commands_consolidated   primitives_consolidated   tour_consolidated
 output; `commands_fitted` is the pre-beautification snapshot kept for
 diagnostics.
 
-### 6.7 Per-command raw-segment labels  (`labels.py`)
+### 6.7 Per-command raw-segment labels  (low geometry, `labels.py`)
 
-When the vectorizer is built with `labeled_segments=segment.labeled_segments`,
-it produces `labeled_commands_consolidated` — one `LabeledCommand` per
-emitted command. Drawing commands (pen-down line / arc / circle) carry
-a list of `CommandSpan` runs naming the raw segments their primitive
-came from; spins and pen-up transit commands carry an empty span list.
+The shared label types `CommandSpan` and `LabeledCommand` live in
+`vectorize/labels_common.py`; both vectorizers emit them, so low- and
+high-geometry labels are the same type and reference the same
+raw-segment ids (directly comparable). Low geometry produces them
+*structurally* (this section); high geometry produces them
+*geometrically* (§6.8).
+
+When the low-geometry vectorizer is built with
+`labeled_segments=segment.labeled_segments`, it produces
+`labeled_commands_consolidated` — one `LabeledCommand` per emitted
+command. Drawing commands (pen-down line / arc / circle) carry a list
+of `CommandSpan` runs naming the raw segments their primitive came
+from; spins and pen-up transit commands carry an empty span list.
 
 Each `CommandSpan` has:
 
@@ -526,10 +534,41 @@ exactly one `CommandSpan` covering `raw[0:len]` and ratio
 the same code path when a primitive consumed only part of a raw
 segment (a corner split mid-stroke).
 
-Important scope note: labels are produced for `commands_consolidated`
-only. `OptimizeRoute` (stage 5) reorders commands and re-emits transit
-spins/lines, so its `commands` output is **not** labeled — the labels
-are tied to the consolidated tour the labeler walked.
+Important scope note: the *structural* low-geometry labeler is tied to
+the consolidated tour it walked, so it only labels
+`commands_consolidated`. `OptimizeRoute` (stage 5) reorders commands
+and re-emits transit spins/lines, so that stream is **not** structurally
+labeled — but the geometric labeler in §6.8 can label any stream,
+including the optimized one, since it reads only the emitted geometry.
+
+### 6.8 Per-command raw-segment labels  (high geometry / geometric, `labels_common.py`)
+
+The high-geometry baseline is frozen and tracks no point-range
+provenance through its segment/classify/order logic, so there is no
+structural command → primitive → polyline chain to walk. Its labels
+are recovered **geometrically** by `label_commands_geometric`, which
+needs only the emitted command stream plus the raw segments:
+
+1. Replay the command stream to recover each pen-down command's drawn
+   path (a line's two endpoints, an arc's center / radius / sweep).
+2. Sample that path at ~1 point per pixel.
+3. Match each sample to the nearest raw-segment pixel via a KDTree —
+   the same KDTree construction the segment stage uses (§4.1).
+4. Compress consecutive same-id samples into `CommandSpan` runs, taking
+   the raw-index range from the matched pixels and the ratio range
+   from the sample parameters.
+
+`HighGeometryVectorize` takes an optional `raw_segments` argument
+(the pipeline passes `segment.segments`); when supplied it populates
+`labeled_commands` parallel to `commands`. For the geometric labeler,
+`LabeledCommand.primitive_id` is the drawing command's ordinal in draw
+order (a stable handle, not an index into any primitive list) and
+`final_segment_index` is `None` (the baseline doesn't carry the
+final-segment abstraction).
+
+Because it reads only geometry, the same function labels the
+route-optimized stream too — call it with `optimized.commands` and the
+same `segment.segments` when you need labels on stage 5's output.
 
 ---
 
@@ -638,7 +677,7 @@ become?" without re-deriving it from geometry. The chain is:
 
 ```
 binary pixel  →  skeleton pixel  →  raw segment id  →  final segment span  →  drawing command
-                 (§3.3)            (§4.1)            (§4.1)                 (§6.7)
+                 (§3.3)            (§4.1)            (§4.1)                 (§6.7 / §6.8)
 ```
 
 Each hop is implemented independently and exposes its lookup
@@ -649,7 +688,15 @@ granularity they need:
 |-----|-------|----------|-------|
 | binary pixel → skeleton pixel | Skeletonize | `labeling: (H, W) int32` (-1 = outside binary) | `Skeletonize.labeling` |
 | skeleton/final pixel → raw segment id (+ index, + raw range) | Segment | `labeled_segments: List[LabeledSegment]` with per-pixel `raw_ids`/`raw_indices` and run-compressed `RawSegmentSpan` lists | `Segment.labeled_segments` |
-| drawing command → raw segment id (+ index, + ratio) | Vectorize | `labeled_commands_consolidated: List[LabeledCommand]` with per-command `CommandSpan` lists | `LowGeometryVectorize.labeled_commands_consolidated` |
+| drawing command → raw segment id (+ index, + ratio), low geometry | Vectorize | `labeled_commands_consolidated: List[LabeledCommand]` (structural) | `LowGeometryVectorize.labeled_commands_consolidated` |
+| drawing command → raw segment id (+ index, + ratio), high geometry | Vectorize | `labeled_commands: List[LabeledCommand]` (geometric) | `HighGeometryVectorize.labeled_commands` |
+
+Both vectorizers emit the same `CommandSpan` / `LabeledCommand` types
+(defined in `vectorize/labels_common.py`) against the same raw-segment
+ids, so a low- and a high-geometry command are directly comparable.
+They differ only in *how* the link is found: low geometry tracks
+provenance structurally (§6.7); high geometry, which is frozen and
+keeps no provenance, recovers it geometrically (§6.8).
 
 Walking forward: a binary pixel `(y, x)` lands on
 `Skeletonize.labeling[y, x]`, a row-major flat index into the True
@@ -685,10 +732,14 @@ Scope limits worth knowing:
   the cascade — fusion bridges hug ink between the joined endpoints,
   and repair's LS-solved junction point sits within the original
   cluster.
-- Command labels are produced for `commands_consolidated` only;
-  `OptimizeRoute` reorders commands and re-emits transit
-  spins/lines, so its `commands` output is not labeled. Re-running
-  the labeler against the optimized tour would close that gap.
+- The low-geometry command mapping is *structural* and is produced
+  for `commands_consolidated` only; `OptimizeRoute` reorders commands
+  and re-emits transit spins/lines, so that stream isn't structurally
+  labeled. The high-geometry command mapping is *geometric*
+  (sample-and-match against the raw segments) and so works on any
+  command stream — including the route-optimized one. Use
+  `label_commands_geometric(optimized.commands, segment.segments, …)`
+  when you need labels on stage 5's output.
 
 ---
 
@@ -757,6 +808,7 @@ release/
     labels.py            final-polyline pixel → raw segment id (KDTree)
   graph/               stage 3 — StrokeGraph (endpoints→vertices)
   vectorize/
+    labels_common.py   shared CommandSpan/LabeledCommand + geometric labeler
     low_geometry/      stage 4, the real path
       fitting.py         polyline → primitive chain (corners/inflections/MDL)
       primitives.py      Line / Arc / Circle
@@ -765,8 +817,9 @@ release/
       beautify.py        detect near-relations; merge arcs into circles
       manifest.py        constraint bundle types
       routing.py         Eulerian / Chinese-Postman ordering
-      labels.py          drawing command → raw segment spans (+ ratios)
+      labels.py          drawing command → raw segment spans (structural)
     high_geometry/     stage 4, the naive comparison baseline
+                       (command labels recovered geometrically)
 
 test.py                runs every example end to end, prints metrics
 test.sh                unit tests, then the example run
@@ -802,7 +855,12 @@ print(opt_low.estimated_time_after)   # estimated draw time (s)
 # Cross-stage labels (see §9):
 print(skeleton.labeling.shape)                       # (H, W) int32 per-pixel
 print(segment.labeled_segments[0].spans)             # raw-segment runs
-print(low.labeled_commands_consolidated[0].spans)    # raw-segment per command
+print(low.labeled_commands_consolidated[0].spans)    # low-geom command labels
+print(high.labeled_commands[0].spans)                # high-geom command labels
+
+# Geometric labeler works on any command stream, incl. the optimized one:
+from release.vectorize.labels_common import label_commands_geometric
+opt_labels = label_commands_geometric(opt_low.commands, segment.segments)
 ```
 
 A single example processes in ~10–15 s; the full suite takes several
@@ -819,13 +877,17 @@ For each example the harness writes a set of debug PNGs into
 | `<name>.segments.labeling.png` | 2 | every final-polyline span coloured by its raw-segment id (§4.1) |
 | `<name>.graph.png` | 3 | stroke graph with vertices and edges |
 | `<name>.vectorized.svg` | 4 | high / low / optimized 3-panel comparison |
-| `<name>.commands.labeling.png` | 4 | every drawing command coloured by its raw-segment-span ids (§6.7) |
+| `<name>.commands.labeling.png` | 4 | every low-geometry drawing command coloured by its raw-segment-span ids (§6.7) |
+| `<name>.commands.labeling.high.png` | 4 | same for the high-geometry baseline, recovered geometrically (§6.8) |
 | `<name>.heatmap.png`, `<name>.overlay.png`, `<name>.overlay.clean.png` | 5–6 | firmware-time heatmap and source-image overlays |
 
-Adjacent labels in the three `*.labeling.png` renders always land at
+Adjacent labels in the four `*.labeling*.png` renders always land at
 well-separated hues (golden-ratio palette + stride renumbering), so
 an over-merge shows as a single colour where two would be expected
-and an over-split shows as a hue jump inside one continuous run.
+and an over-split shows as a hue jump inside one continuous run. The
+two `commands.labeling` renders share the raw-segment colour basis,
+so you can compare how the low and high vectorizers carve the same
+raw strokes into commands.
 
 ---
 
@@ -844,7 +906,10 @@ and an over-split shows as a hue jump inside one continuous run.
   every caller — a stale 5-tuple unpack is exactly the bug that used
   to crash the test harness.
 - **High geometry is frozen.** It is a baseline, not a place to add
-  features. Improvements go in low geometry.
+  features. Improvements go in low geometry. (The raw-segment command
+  labels it now carries are the exception that proves the rule: they're
+  recovered *geometrically* from its emitted commands without touching
+  the frozen segment/classify/order logic — see §6.8.)
 - **Two command snapshots.** `commands_consolidated` is the real
   output; `commands_fitted` is a diagnostic snapshot. Don't confuse
   them. Neither is route-optimized — that's `OptimizeRoute`.
@@ -867,11 +932,13 @@ and an over-split shows as a hue jump inside one continuous run.
   "all but last" slice sentinel. To slice the raw segment regardless
   of direction, use
   `raw_segments[id][min(raw_start, raw_end) : max(raw_start, raw_end) + 1]`.
-- **`OptimizeRoute` invalidates command labels.** Stage 5 reorders
-  primitives and re-emits transit commands, so its `commands` output
-  is unlabeled. Use `low.labeled_commands_consolidated` (against
-  `low.commands_consolidated`) if you need labels; re-label the
-  optimized tour if you need labels on the post-optimization output.
+- **`OptimizeRoute` invalidates the structural command labels.**
+  Stage 5 reorders primitives and re-emits transit commands, so the
+  low-geometry structural labels (`low.labeled_commands_consolidated`,
+  tied to `low.commands_consolidated`) don't carry over to its output.
+  The geometric labeler does carry over: call
+  `label_commands_geometric(opt_low.commands, segment.segments)` for
+  labels on the post-optimization stream (§6.8).
 
 ---
 
