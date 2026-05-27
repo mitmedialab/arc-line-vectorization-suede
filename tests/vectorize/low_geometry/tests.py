@@ -740,10 +740,11 @@ def test_simulator_arc_lands_at_p1():
         {"kind": "spin", "degrees": math.degrees(start_heading)},
         {"kind": "arc", "radius": r, "degrees": sweep_deg},
     ]
-    ops = _simulate(cmds, (10.0, 0.0), 0.0)
-    # The single arc op should end at (0, 10)
-    arc_op = [op for op in ops if op[0] == "arc"][0]
-    assert _close(arc_op[1]["p1"], [0.0, 10.0], 1e-6), f"sim p1: {arc_op[1]['p1']}"
+    # _simulate returns (drawn, pen_up, bounds); ``drawn`` is a list of
+    # dicts each keyed by "kind" with geometry fields p0/p1/center/...
+    drawn, _pen_up, _bounds = _simulate(cmds, (10.0, 0.0), 0.0)
+    arc_op = [d for d in drawn if d["kind"] == "arc"][0]
+    assert _close(arc_op["p1"], [0.0, 10.0], 1e-6), f"sim p1: {arc_op['p1']}"
 
 
 def test_simulator_arc_lands_at_p1_for_major_arc():
@@ -758,9 +759,9 @@ def test_simulator_arc_lands_at_p1_for_major_arc():
         {"kind": "spin", "degrees": math.degrees(start_heading)},
         {"kind": "arc", "radius": r, "degrees": sweep_deg},
     ]
-    ops = _simulate(cmds, (10.0, 0.0), 0.0)
-    arc_op = [op for op in ops if op[0] == "arc"][0]
-    assert _close(arc_op[1]["p1"], [0.0, 10.0], 1e-5), f"sim p1: {arc_op[1]['p1']}"
+    drawn, _pen_up, _bounds = _simulate(cmds, (10.0, 0.0), 0.0)
+    arc_op = [d for d in drawn if d["kind"] == "arc"][0]
+    assert _close(arc_op["p1"], [0.0, 10.0], 1e-5), f"sim p1: {arc_op['p1']}"
 
 
 # ---------------------------------------------------------------------------

@@ -979,7 +979,7 @@ def commands_to_heatmap(
 
     Args:
         commands: a sequence of ``DrawingCommand`` (typically
-            ``LowGeometryVectorize(...).consolidated`` or
+            ``LowGeometryVectorize(...).commands_consolidated`` or
             ``OptimizeRoute(...).commands``).
         output_path: optional path to save a PNG.
         start_pos / start_heading: robot's starting pose; MUST match
@@ -1230,7 +1230,7 @@ def commands_to_overlay(
     Args:
         commands: the optimized command sequence (e.g.
             ``OptimizeRoute(...).commands`` or
-            ``LowGeometryVectorize(...).consolidated``).
+            ``LowGeometryVectorize(...).commands_consolidated``).
         source: file path / PIL image / numpy array of the source.
         output_path: optional PNG path to write to.
         stroke_color: RGBA for the overlay strokes.

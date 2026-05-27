@@ -351,6 +351,39 @@ def fit_circle(
 
 _MAX_RADIUS_FACTOR = 8.0
 
+# Minimum arc sagitta (max perpendicular bow of the arc away from its
+# chord) for a fitted arc to be kept as an Arc rather than degraded to a
+# Line. An arc whose bow is below ~1 px is visually a straight line: the
+# pen draws the same picture either way, but as an Arc it carries a
+# radius/sweep the firmware estimator and the joint solver both treat as
+# real curvature. ``routing.py`` already degrades sub-0.5 px arcs at
+# emit time; applying the (slightly stricter) test here in ``fit_arc``
+# means the primitive is a Line from the start, so the solver,
+# beautification and routing all see a consistent shape. The threshold
+# is an absolute pixel value on purpose — "sub-pixel bow" is a
+# scale-invariant notion of "indistinguishable from a line".
+_MIN_ARC_SAGITTA_PX = 1.0
+
+# Absolute pixel ceiling on the RMS tolerance of ``fit_polyline``'s
+# "accept the whole corner-free polyline as one Arc" shortcut. On the
+# order of a stroke width: large enough that genuine pen tremor on a
+# clean arc still shortcuts, small enough that a deliberately wavy edge
+# (cheese-block scallops) is rejected and sent to chain subdivision so
+# the waviness is preserved. See the shortcut site in ``fit_polyline``.
+_SINGLE_ARC_SHORTCUT_RMS_CAP = 6.0
+
+# Looser companion ceiling. Between the strict cap and this value the
+# arc fit is "borderline": the shortcut is taken only if the polyline
+# is too SPARSE to subdivide reliably (see ``_SUBDIVISION_MIN_POINTS``).
+_SINGLE_ARC_SHORTCUT_RMS_LOOSE_CAP = 12.0
+
+# Minimum point count for a borderline-rms polyline to be sent to chain
+# subdivision rather than kept as one arc. Below this, subdivision
+# would split too few points among the resulting pieces, leaving each
+# piece's fit (and the joint solve) under-constrained. Densely sampled
+# polylines above this threshold subdivide reliably.
+_SUBDIVISION_MIN_POINTS = 40
+
 
 def _has_curvature_reversal(
     pts: NDArray[np.float64],
@@ -475,6 +508,17 @@ def fit_arc(pts: NDArray[np.float64]) -> Tuple[Optional[Arc], float]:
     sweep_sign = -1.0 if side_mid > 0 else 1.0
     sweep = sweep_sign * sweep_mag
     bulge = float(np.tan(sweep / 4.0))
+
+    # Sagitta gate: reject arcs whose perpendicular bow is sub-pixel.
+    # sagitta = r * (1 - cos(sweep / 2)). Such an "arc" is visually a
+    # straight line; returning None lets ``fit_single_primitive`` /
+    # ``fuse_chain`` pick the Line instead, which is cheaper for the
+    # solver and avoids feeding the firmware estimator a spurious
+    # radius. (A genuine gentle arc — e.g. 10 deg over a 150 px chord —
+    # has several px of sagitta and is unaffected.)
+    sagitta = r * (1.0 - math.cos(0.5 * sweep_mag))
+    if sagitta < _MIN_ARC_SAGITTA_PX:
+        return None, float("inf")
 
     arc = Arc(p0.copy(), p1.copy(), bulge)
     return arc, rms
@@ -760,43 +804,83 @@ def fit_segment_dp(
     return chain
 
 
-def find_closed_subloop(
+def _validate_subloop_candidate(
+    pts: NDArray[np.float64],
+    i: int,
+    j: int,
+    stride: int,
+    min_size: int,
+    max_circle_rms_rel: float,
+) -> Optional[Tuple[int, int]]:
+    """Check one ``(i, j)`` sub-loop candidate: it must fit a clean
+    circle, be roughly circular in aspect, and is then refined to the
+    exact closest endpoint pair. Returns the refined ``(i, j)`` or
+    ``None`` if the candidate fails any gate.
+    """
+    n = len(pts)
+    sub = pts[i:j + 1]
+    circle, rms = fit_full_circle(sub)
+    if circle is None:
+        return None
+    loop_ext = _segment_extent(sub)
+    if rms >= max_circle_rms_rel * loop_ext:
+        return None
+    xs = sub[:, 0]
+    ys = sub[:, 1]
+    bbox_x = float(xs.max() - xs.min())
+    bbox_y = float(ys.max() - ys.min())
+    if min(bbox_x, bbox_y) < _EPS:
+        return None
+    aspect = max(bbox_x, bbox_y) / min(bbox_x, bbox_y)
+    if aspect >= 1.25:
+        return None
+    # Refine: shift i and j by +/-stride to find the exact closest pair.
+    best_d = float(np.linalg.norm(pts[j] - pts[i]))
+    refined_i, refined_j = i, j
+    for di in range(-stride, stride + 1):
+        ii = i + di
+        if ii < 0 or ii >= n:
+            continue
+        for dj in range(-stride, stride + 1):
+            jj = j + dj
+            if jj < 0 or jj >= n or jj - ii < min_size:
+                continue
+            d = float(np.linalg.norm(pts[jj] - pts[ii]))
+            if d < best_d:
+                best_d = d
+                refined_i, refined_j = ii, jj
+    return (refined_i, refined_j)
+
+
+def find_closed_subloops(
     pts: NDArray[np.float64],
     min_size: int = 100,
     closure_threshold_rel: float = 0.06,
     min_extent_rel: float = 0.20,
     max_circle_rms_rel: float = 0.06,
-) -> Optional[Tuple[int, int]]:
-    """Find a near-closed sub-loop within an open polyline that
-    ALSO fits a single Circle well.
+) -> List[Tuple[int, int]]:
+    """Find ALL near-closed circular sub-loops within an open polyline.
 
-    Looks for (i, j) with ``j - i >= min_size`` such that:
-      1. ``||pts[j] - pts[i]||`` < ``closure_threshold_rel * polyline_extent``
-         (the endpoints meet)
-      2. ``extent(pts[i:j+1])`` >= ``min_extent_rel * polyline_extent``
-         (the loop has meaningful spatial size; rules out tiny
-         self-crossings)
-      3. The sub-loop fits a circle with RMS below
-         ``max_circle_rms_rel * loop_extent`` (the loop is actually
-         circular — rules out V-shapes or U-shapes whose endpoints
-         happen to be close but whose interior path isn't a circle)
+    Generalizes ``find_closed_subloop``: a single hand-drawn stroke can
+    thread more than one loop (a figure-8, a stack of bubbles drawn
+    without lifting the pen, a flower drawn as several petals off one
+    contour). Each qualifying sub-loop is split out so it can hit the
+    closed-circle shortcut independently.
 
-    Returns ``(i, j)`` for the LARGEST qualifying sub-loop, or
-    ``None``. The largest is preferred because outer/wider loops
-    are usually the intended shape (a wheel rim, not a small
-    embedded swirl).
-
-    Example: bikelove's right-wheel polyline poly[14] traces the
-    rim for ~650 indices and then continues into the bottom
-    squiggle. Detecting [0, 650] as a circular sub-loop lets the
-    rim become a Circle while the squiggle gets fit separately.
+    Each returned ``(i, j)`` satisfies the same three gates as the
+    single-loop version (endpoints meet, meaningful spatial extent,
+    fits a circle with low RMS and near-unit aspect). Returned loops
+    are pairwise NON-OVERLAPPING — when candidates overlap, the larger
+    is kept (outer/wider loops are usually the intended shape). The
+    list is sorted by start index so callers can use it directly as
+    split points.
     """
     n = len(pts)
     if n < 2 * min_size:
-        return None
+        return []
     extent = _segment_extent(pts)
     if extent < 1.0:
-        return None
+        return []
     closure_thresh = closure_threshold_rel * extent
     extent_thresh = min_extent_rel * extent
 
@@ -814,48 +898,60 @@ def find_closed_subloop(
                 break  # take largest j for this i
 
     if not candidates:
-        return None
+        return []
 
-    # Try the largest candidates first; require a clean circle fit
-    # AND a reasonable aspect ratio (a true wheel/sun is roughly
-    # circular, not stretched).
+    # Largest first; accept a candidate only if it passes the circle /
+    # aspect gates AND does not overlap an already-accepted loop.
     candidates.sort(reverse=True)
-    for size, i, j in candidates:
-        sub = pts[i:j + 1]
-        circle, rms = fit_full_circle(sub)
-        if circle is None:
+    accepted: List[Tuple[int, int]] = []
+    for _size, i, j in candidates:
+        if any(not (j < ai or i > aj) for ai, aj in accepted):
+            continue  # overlaps a kept loop
+        refined = _validate_subloop_candidate(
+            pts, i, j, stride, min_size, max_circle_rms_rel
+        )
+        if refined is None:
             continue
-        loop_ext = _segment_extent(sub)
-        if rms >= max_circle_rms_rel * loop_ext:
+        ri, rj = refined
+        # Re-check overlap after refinement.
+        if any(not (rj < ai or ri > aj) for ai, aj in accepted):
             continue
-        xs = sub[:, 0]
-        ys = sub[:, 1]
-        bbox_x = float(xs.max() - xs.min())
-        bbox_y = float(ys.max() - ys.min())
-        if min(bbox_x, bbox_y) < _EPS:
-            continue
-        aspect = max(bbox_x, bbox_y) / min(bbox_x, bbox_y)
-        if aspect >= 1.25:
-            continue
-        # Refine: shift i and j by +/-stride to find the exact
-        # closest pair.
-        i0, j0 = i, j
-        best_d = float(np.linalg.norm(pts[j0] - pts[i0]))
-        refined_i, refined_j = i0, j0
-        for di in range(-stride, stride + 1):
-            ii = i0 + di
-            if ii < 0 or ii >= n:
-                continue
-            for dj in range(-stride, stride + 1):
-                jj = j0 + dj
-                if jj < 0 or jj >= n or jj - ii < min_size:
-                    continue
-                d = float(np.linalg.norm(pts[jj] - pts[ii]))
-                if d < best_d:
-                    best_d = d
-                    refined_i, refined_j = ii, jj
-        return (refined_i, refined_j)
-    return None
+        accepted.append((ri, rj))
+
+    accepted.sort()
+    return accepted
+
+
+def find_closed_subloop(
+    pts: NDArray[np.float64],
+    min_size: int = 100,
+    closure_threshold_rel: float = 0.06,
+    min_extent_rel: float = 0.20,
+    max_circle_rms_rel: float = 0.06,
+) -> Optional[Tuple[int, int]]:
+    """Find the single LARGEST near-closed circular sub-loop within an
+    open polyline (thin wrapper over ``find_closed_subloops``, kept for
+    callers that only want one).
+
+    See ``find_closed_subloops`` for the gate criteria. The largest is
+    preferred because outer/wider loops are usually the intended shape
+    (a wheel rim, not a small embedded swirl).
+
+    Example: bikelove's right-wheel polyline poly[14] traces the rim
+    for ~650 indices and then continues into the bottom squiggle.
+    Detecting [0, 650] as a circular sub-loop lets the rim become a
+    Circle while the squiggle gets fit separately.
+    """
+    loops = find_closed_subloops(
+        pts,
+        min_size=min_size,
+        closure_threshold_rel=closure_threshold_rel,
+        min_extent_rel=min_extent_rel,
+        max_circle_rms_rel=max_circle_rms_rel,
+    )
+    if not loops:
+        return None
+    return max(loops, key=lambda ij: ij[1] - ij[0])
 
 
 def _line_collapse(
@@ -1315,16 +1411,20 @@ def fit_polyline(
     # Splitting first lets each side of the corner be fit cleanly as
     # a single primitive.
     #
-    # ALSO: look for a near-closed sub-loop within the polyline (e.g.,
+    # ALSO: look for near-closed sub-loops within the polyline (e.g.,
     # the bikelove right wheel rim is the first ~650 indices of a
-    # 994-pt polyline that continues into the bottom squiggle). If a
-    # sub-loop exists, split at its start and end indices so the loop
-    # portion is processed as its own near-closed sub-polyline (which
-    # will then hit the closed-circle shortcut).
-    subloop = find_closed_subloop(pts) if not is_near_closed_polyline(pts) else None
+    # 994-pt polyline that continues into the bottom squiggle). A
+    # single stroke can thread several loops (figure-8s, stacked
+    # bubbles), so every qualifying sub-loop is split out; each loop
+    # region is then processed as its own near-closed sub-polyline
+    # (which hits the closed-circle shortcut).
+    subloops = (
+        find_closed_subloops(pts) if not is_near_closed_polyline(pts) else []
+    )
     splits: List[int] = list(corners)
-    if subloop is not None:
-        splits.extend(subloop)
+    for si, sj in subloops:
+        splits.append(si)
+        splits.append(sj)
     # Also split at smooth curvature reversals (S-curve inflections).
     # ``find_corners`` only fires on tangent-direction discontinuities
     # (kinks ≥50°); a polyline that smoothly switches from CCW to CW
@@ -1372,21 +1472,44 @@ def fit_polyline(
     # when the fit is so close to a real arc that chain subdivision
     # couldn't do meaningfully better.
     #
-    # Critically, the threshold is BOTH 4% of extent AND capped at an
-    # absolute pixel ceiling. A pure relative threshold relaxes
-    # linearly with extent, so a 700-pixel polyline gets a 28-px
-    # tolerance — that's enough to swallow significant shape detail
-    # (heartman's body sub-segments were 706 pts with arc-fit rms of
-    # 23 px, just under 28 px, so the whole body collapsed to one
-    # arc with 23 px of accumulated deviation). The absolute cap of
-    # ~12 px keeps the shortcut "this is essentially noise on a clean
-    # arc" for polylines of any length.
-    arc_rms_abs = min(0.04 * extent, 12.0)
+    # Critically, the threshold is BOTH a fraction of extent AND capped
+    # at an absolute pixel ceiling. A pure relative threshold relaxes
+    # linearly with extent, so a 700-pixel polyline gets a large
+    # tolerance — enough to swallow significant shape detail (heartman's
+    # body sub-segments were 706 pts with arc-fit rms of 23 px, so the
+    # whole body collapsed to one arc with 23 px of accumulated
+    # deviation). The absolute cap keeps the shortcut meaning "this is
+    # essentially noise on a clean arc" for polylines of any length.
+    #
+    # The cap is two-tier. ``_SINGLE_ARC_SHORTCUT_RMS_CAP`` (~1 stroke
+    # width) is the "definitely one clean arc" tolerance. Between that
+    # and ``_SINGLE_ARC_SHORTCUT_RMS_LOOSE_CAP`` the fit is borderline,
+    # and the deciding question is whether chain subdivision can be
+    # *trusted* to do better. Subdivision splits the points among 2-3
+    # pieces and re-fits each; that is only reliable when the polyline
+    # is densely enough sampled that each resulting piece still has
+    # enough points to constrain its fit and the joint solve. A sparse
+    # polyline (few points spread over a large extent) subdivides into
+    # under-constrained pieces that the solve pulls *off* the data —
+    # this is what regressed the smile mouth (a 22-point segment).
+    #
+    # So: a borderline-rms polyline keeps the one-arc shortcut when it
+    # is too sparse to subdivide safely (``n`` below
+    # ``_SUBDIVISION_MIN_POINTS``); a densely sampled borderline
+    # polyline falls through to chain subdivision, which tracks the
+    # real shape detail (the cheese block's irregular edges, ~135
+    # points each, fit a single arc at ~9 px rms but are visibly
+    # better as a short arc chain). RMS magnitude alone cannot tell a
+    # subdivide-worthy edge from clean tremor; sample density can.
+    arc_rms_strict = min(0.04 * extent, _SINGLE_ARC_SHORTCUT_RMS_CAP)
+    arc_rms_loose = min(0.04 * extent, _SINGLE_ARC_SHORTCUT_RMS_LOOSE_CAP)
     if not corners:
         arc, arc_rms = fit_arc(pts)
-        if (arc is not None and arc_rms < arc_rms_abs and
-                arc.chord() > line_tol_abs * 2):
-            return [ChainPiece(0, n, arc)]
+        if arc is not None and arc.chord() > line_tol_abs * 2:
+            if arc_rms < arc_rms_strict:
+                return [ChainPiece(0, n, arc)]
+            if arc_rms < arc_rms_loose and n < _SUBDIVISION_MIN_POINTS:
+                return [ChainPiece(0, n, arc)]
 
     # Single-primitive shortcut (tight tolerance, line OR arc).
     single, _ = fit_single_primitive(pts, line_tol_abs, arc_tol_abs)
