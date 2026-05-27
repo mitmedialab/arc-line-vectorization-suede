@@ -187,6 +187,10 @@ def derive_configs(
             "interp_max_spacing": 1.0 * s,
             "min_curvature_spike_ratio": 2.0,
             "curvature_context_window": 8,
+            # Index gap (count) — not scaled by stroke width.
+            "cascade_gap": 3,
+            # Pixel distance — scaled.
+            "cascade_max_jp_distance": 3.0 * s,
         },
         "post_repair_fuse": {
             "junction_tol": 2.5 * s,
@@ -212,23 +216,6 @@ def derive_configs(
             "sigma": 2.0,
             "corner_threshold": 0.25,
             "max_fit_residual": 5.0 * s,
-        },
-        "high_geometry_consolidate": {
-            "center_tol_rel": 0.25,
-            "radius_tol_rel": 0.25,
-            "center_tol_abs": 3.0 * s,
-            "radius_tol_abs": 3.0 * s,
-            "max_endpoint_snap_rel": 0.15,
-            "max_endpoint_snap_abs": 6.0 * s,
-            "proximity_min_radius_ratio": 0.4,
-            "line_angle_tol_deg": 6.0,
-            "line_offset_tol_abs": 5.0 * s,
-            "min_line_length": 5.0 * s,
-            "max_line_endpoint_snap_abs": 5.0 * s,
-            "junction_epsilon": 3.0 * s,
-            "merge_arcs": True,
-            "merge_lines": True,
-            "return_report": False,
         },
 
         # --- OptimizeRoute --------------------------------------------

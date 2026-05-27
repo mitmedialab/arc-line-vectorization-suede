@@ -23,6 +23,19 @@ Emitted commands match the robot's interface in ``commands.py``:
 Heading convention (per ``commands.py``): positive degrees = CCW in
 image coords (which renders as CW on screen). For arcs, ``radius`` is
 always positive; the sign of ``degrees`` selects direction.
+
+Scope — this stage minimizes PEN-UPS, not total turning. The Eulerian
+/ Chinese-Postman tour picks *an* order that visits every primitive
+with the fewest pen-up jumps, but among the many valid Eulerian paths
+it does not choose the one with the least in-place spinning, and spins
+are a large part of the firmware draw time. Closing that gap is the
+job of ``OptimizeRoute`` (see ``release/optimize.py``), which re-orders
+and re-directs the pen-down primitives against the full firmware
+motion model. ``OptimizeRoute`` is therefore a REQUIRED final stage:
+the command streams produced here (and exposed as
+``LowGeometryVectorize.commands_consolidated``) are pen-up-optimal but
+not time-optimal, and on some images are slower than the naive
+high-geometry baseline until ``OptimizeRoute`` has run.
 """
 
 from __future__ import annotations

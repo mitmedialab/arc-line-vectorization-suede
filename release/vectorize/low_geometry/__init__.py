@@ -22,8 +22,23 @@ Result fields:
 * ``self.primitives_fitted`` — primitives after the first solve.
 * ``self.soft_beautified`` — constraints augmented with beautification.
 * ``self.primitives_consolidated`` — primitives after second solve.
-* ``self.commands`` — robot commands from ``primitives_fitted``.
-* ``self.consolidated`` — robot commands from ``primitives_consolidated``.
+* ``self.commands_fitted`` — robot commands from ``primitives_fitted``.
+* ``self.commands_consolidated`` — robot commands from
+  ``primitives_consolidated``.
+
+The two command snapshots and the routing that feeds each:
+
+    snapshot                primitives                tour
+    ----------------------  ------------------------  --------------------
+    commands_fitted         primitives_fitted         tour
+    commands_consolidated   primitives_consolidated   tour_consolidated
+
+``commands_consolidated`` is the intended pipeline output (it reflects
+the beautification re-solve and arc-pair merging). ``commands_fitted``
+is the pre-beautification snapshot, kept for diagnostics. Neither is
+route-time-optimised — that is ``OptimizeRoute``'s job and is a
+required final stage (see ``routing.py``: the Eulerian router
+minimises pen-ups, not total turning).
 """
 
 from __future__ import annotations
@@ -296,6 +311,19 @@ class Vectorize:
                 # then collapses them into one vertex.
                 if len(pids) >= 2:
                     poly = self.graph.polylines[seg.polyline_index]
+                    # NOTE: ``abs_tol`` here is deliberately stricter
+                    # (5 px) than ``is_near_closed_polyline``'s default
+                    # (10 px, used by ``fit_polyline`` to decide "is
+                    # this loop a Circle"). The two tests answer
+                    # different questions. The fitting test can afford
+                    # to be generous — mis-classifying a 10 px-gap loop
+                    # as a Circle is visually fine. This test ADDS A
+                    # HARD COINCIDE pulling the chain's two ends
+                    # together; doing that on a stroke that wasn't
+                    # really meant to close (a 6-10 px gap that is
+                    # genuine open geometry) would visibly distort it.
+                    # So the wrap-around joint only fires on near-exact
+                    # closure.
                     if is_near_closed_polyline(poly, abs_tol=5.0):
                         first_pid = pids[0]
                         last_pid = pids[-1]
@@ -444,7 +472,7 @@ class Vectorize:
         self.tour = order_primitives(
             self.primitives_fitted, self.start_pos, snap_tol=snap_tol
         )
-        self.commands: Sequence[DrawingCommand] = to_commands(
+        self.commands_fitted: Sequence[DrawingCommand] = to_commands(
             self.primitives_fitted,
             self.tour,
             self.start_pos,
@@ -455,7 +483,7 @@ class Vectorize:
         self.tour_consolidated = order_primitives(
             self.primitives_consolidated, self.start_pos, snap_tol=snap_tol
         )
-        self.consolidated: Sequence[DrawingCommand] = to_commands(
+        self.commands_consolidated: Sequence[DrawingCommand] = to_commands(
             self.primitives_consolidated,
             self.tour_consolidated,
             self.start_pos,
@@ -492,13 +520,13 @@ class Vectorize:
         n_arcs = sum(1 for p in self.primitives_fitted if isinstance(p, Arc))
         n_circles = sum(1 for p in self.primitives_fitted if isinstance(p, Circle))
         n_pen_ups = sum(
-            1 for c in self.commands if c["kind"] == "line" and not c["penDown"]
+            1 for c in self.commands_fitted if c["kind"] == "line" and not c["penDown"]
         )
         return (
             f"{len(self.primitives_fitted)} primitives "
             f"({n_lines} lines, {n_arcs} arcs, {n_circles} circles) "
             f"in {len(self.fitted_segments)} chains, "
-            f"{len(self.commands)} commands "
+            f"{len(self.commands_fitted)} commands "
             f"({n_pen_ups} pen-ups), "
             f"first-solve cost={self.solve_result.cost:.2f}, "
             f"consolidated cost={self.solve_result_consolidated.cost:.2f}"

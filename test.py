@@ -12,6 +12,7 @@ from release import (
     OptimizeRoute,
 )
 from release.auto_config import derive_configs
+from release.fidelity import coverage_metrics, format_metrics
 from release.visualize import (
     commands_to_heatmap,
     commands_to_overlay,
@@ -31,6 +32,11 @@ import json
 import numpy as np
 from numpy.typing import NDArray
 from PIL import Image
+
+# GIF generation is the single most expensive visualization step (it
+# dominates per-example wall time). It is opt-in: set the environment
+# variable PIPELINE_GIFS=1 to enable the animated comparison GIFs.
+GENERATE_GIFS = os.environ.get("PIPELINE_GIFS", "0") not in ("0", "", "false")
 
 examples = [
     "hooreye",
@@ -146,7 +152,7 @@ class Visualize:
         high_time = estimate_total_time(high.commands)
         panels = [
             (high.commands, f"high ({high_time:.2f}s)"),
-            (low.consolidated, f"low ({optimized.estimated_time_before:.2f}s)"),
+            (low.commands_consolidated, f"low ({optimized.estimated_time_before:.2f}s)"),
             (optimized.commands, f"optimized ({optimized.estimated_time_after:.2f}s)"),
         ]
         commands_to_svg_compare_n(
@@ -155,12 +161,13 @@ class Visualize:
             start_pos=start_pos,
             start_heading=start_heading,
         )
-        commands_to_svg_gif_compare_n(
-            panels,
-            f"examples/{name}.vectorized.gif",
-            start_pos=(start_pos[0], start_pos[1]),
-            start_heading=start_heading,
-        )
+        if GENERATE_GIFS:
+            commands_to_svg_gif_compare_n(
+                panels,
+                f"examples/{name}.vectorized.gif",
+                start_pos=(start_pos[0], start_pos[1]),
+                start_heading=start_heading,
+            )
 
     @classmethod
     def heatmap(
@@ -294,12 +301,11 @@ def process_example(example: str) -> str:
             start_pos=start_pos,
             start_heading=start_heading,
             commands=HighGeometryVectorize.Config.ToCommands(**cfg["high_geometry_commands"]),
-            consolidate=HighGeometryVectorize.Config.Consolidate(**cfg["high_geometry_consolidate"]),
         )
 
     with step(timings, "optimize"):
         optimized = OptimizeRoute(
-            low_geometry.consolidated,
+            low_geometry.commands_consolidated,
             start_pos=start_pos,
             start_heading=start_heading,
             cfg=OptimizeRoute.Config.Optimize(**cfg["optimize_route"]),
@@ -336,7 +342,76 @@ def process_example(example: str) -> str:
             start_heading=start_heading,
         )
 
-    return f"\n{example}: {optimized.stats()}\n{_format_timings(timings)}"
+    # --- Objective fidelity metric (rasterize the optimized output and
+    # compare it against the source image; see release/fidelity.py).
+    with step(timings, "fidelity"):
+        metrics = coverage_metrics(
+            optimized.commands,
+            skeleton.binary,
+            skeleton.skeletonized,
+            start_pos,
+            start_heading,
+        )
+
+    # --- Regression checks. The pipeline has two invariants worth
+    # asserting on every run:
+    #   (1) the optimized low-geometry route should beat the naive
+    #       high-geometry baseline, and
+    #   (2) OptimizeRoute must never return a route slower than its
+    #       input (guaranteed by the dual-seed + guard in optimize.py;
+    #       checked here so a future regression is caught loudly).
+    high_time = estimate_total_time(high_geometry.commands)
+    checks = []
+    if optimized.estimated_time_after > high_time + 1e-6:
+        checks.append(
+            f"REGRESSION optimized low ({optimized.estimated_time_after:.1f}s) "
+            f"is slower than high baseline ({high_time:.1f}s)"
+        )
+    if optimized.estimated_time_after > optimized.estimated_time_before + 1e-6:
+        checks.append(
+            f"REGRESSION OptimizeRoute worsened the route "
+            f"({optimized.estimated_time_before:.1f}s -> "
+            f"{optimized.estimated_time_after:.1f}s)"
+        )
+    check_line = (
+        "  checks: OK  "
+        f"(optimized {optimized.estimated_time_after:.1f}s vs "
+        f"high {high_time:.1f}s)"
+        if not checks
+        else "\n".join("  !! " + c for c in checks)
+    )
+
+    return (
+        f"\n{example}: {optimized.stats()}"
+        f"\n  {format_metrics(metrics)}"
+        f"\n{check_line}"
+        f"\n{_format_timings(timings)}"
+    )
+
+
+def _default_max_workers() -> int:
+    """Pick a worker count that won't exhaust memory.
+
+    Each worker runs the full pipeline on a 1024x1024 image; under
+    memory pressure a ``ProcessPoolExecutor`` worker can be killed
+    mid-task and silently take its output with it. Cap workers by both
+    CPU count and available memory (~1.5 GB headroom per worker).
+    """
+    cpu = os.cpu_count() or 1
+    avail_kb = 0
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    avail_kb = int(line.split()[1])
+                    break
+    except OSError:
+        avail_kb = 0
+    if avail_kb <= 0:
+        return cpu
+    avail_gb = avail_kb / (1024.0 * 1024.0)
+    mem_cap = max(1, int(avail_gb / 1.5))
+    return max(1, min(cpu, mem_cap))
 
 
 def process(only=None, max_workers=None):
@@ -350,6 +425,9 @@ def process(only=None, max_workers=None):
     if not selected:
         return
 
+    if max_workers is None:
+        max_workers = _default_max_workers()
+
     t_start = time.perf_counter()
     with ProcessPoolExecutor(max_workers=max_workers) as pool:
         futures = {pool.submit(process_example, e): e for e in selected}
@@ -360,7 +438,10 @@ def process(only=None, max_workers=None):
             except Exception as exc:
                 print(f"\n{example}: FAILED with {type(exc).__name__}: {exc}")
     wall = time.perf_counter() - t_start
-    print(f"\nWall clock: {wall:.2f}s for {len(selected)} examples")
+    print(
+        f"\nWall clock: {wall:.2f}s for {len(selected)} examples "
+        f"({max_workers} workers, GIFs {'on' if GENERATE_GIFS else 'off'})"
+    )
 
 
 if __name__ == "__main__":

@@ -54,11 +54,10 @@ def default_pipeline(source: ImageSource):
         start_pos=start_pos,
         start_heading=start_heading,
         commands=HighGeometryVectorize.Config.ToCommands(**cfg["high_geometry_commands"]),
-        consolidate=HighGeometryVectorize.Config.Consolidate(**cfg["high_geometry_consolidate"]),
     )
 
     optimized_low_geometry = OptimizeRoute(
-        low_geometry.consolidated,
+        low_geometry.commands_consolidated,
         start_pos=start_pos,
         start_heading=start_heading,
         cfg=OptimizeRoute.Config.Optimize(**cfg["optimize_route"]),
