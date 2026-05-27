@@ -19,6 +19,9 @@ from release.visualize import (
     commands_to_svg,
     commands_to_svg_compare_n,
     commands_to_svg_gif_compare_n,
+    visualize_command_labeling,
+    visualize_segment_labeling,
+    visualize_skeleton_labeling,
 )
 from release.optimize import estimate_total_time
 
@@ -79,9 +82,12 @@ class Visualize:
         extensions = ["png", "svg", "json", "gif"]
         suffixes = [
             "skeleton",
+            "skeleton.labeling",
             "segments",
+            "segments.labeling",
             "graph",
             "vectorized",
+            "commands.labeling",
             "heatmap",
             "overlay",
             "overlay.clean",
@@ -106,10 +112,22 @@ class Visualize:
         fig = visualize_pipeline(
             skeleton.binary,
             skeleton.collapsed,
+            skeleton.eye_detection,
+            skeleton.eyes_resolved,
             skeleton.detection,
             skeleton.uncrossed,
         )
         fig.savefig(f"examples/{name}.skeleton.png")
+        # Per-pixel labeling debug: every binary pixel coloured by the
+        # skeleton pixel it's geodesically nearest to. Lets you spot
+        # mis-attributions at junctions and verify the partition is
+        # consistent with stroke topology.
+        visualize_skeleton_labeling(
+            skeleton.binary,
+            skeleton.uncrossed,
+            skeleton.labeling,
+            output_path=f"examples/{name}.skeleton.labeling.png",
+        )
 
     @classmethod
     def segments(cls, skeleton: Skeletonize, segment: Segment, name: str):
@@ -134,6 +152,41 @@ class Visualize:
                 ),
             ]
         ).save(f"examples/{name}.segments.png")
+        # Per-pixel raw-segment labeling debug: each final-polyline
+        # span coloured by its raw-segment id, with the contributing
+        # raw segments faintly underlaid in the same colour. Adjacent
+        # spans get well-separated palette positions so an over-merge
+        # or over-split is obvious.
+        visualize_segment_labeling(
+            skeleton.binary,
+            segment.segments,
+            segment.labeled_segments,
+            output_path=f"examples/{name}.segments.labeling.png",
+        )
+
+    @classmethod
+    def command_labeling(
+        cls,
+        skeleton: Skeletonize,
+        segment: Segment,
+        low: LowGeometryVectorize,
+        name: str,
+        start_pos: NDArray,
+        start_heading: float,
+    ):
+        if low.labeled_commands_consolidated is None:
+            return
+        # Use the pre-optimization (consolidated) commands so the spans
+        # match the tour the labeler walked. OptimizeRoute reorders
+        # primitives without re-running the labeler.
+        visualize_command_labeling(
+            skeleton.binary,
+            segment.segments,
+            low.labeled_commands_consolidated,
+            start_pos=(start_pos[0], start_pos[1]),
+            start_heading=start_heading,
+            output_path=f"examples/{name}.commands.labeling.png",
+        )
 
     @classmethod
     def vectorized(
@@ -252,6 +305,7 @@ def process_example(example: str) -> str:
             Skeletonize.Config.Binarize(**cfg["binarize"]),
             Skeletonize.Config.Skeletonize(**cfg["skeletonize"]),
             Skeletonize.Config.Collapse(**cfg["collapse"]),
+            Skeletonize.Config.Eyes(**cfg["eyes"]),
             detect_config=cfg["detect"],
         )
 
@@ -293,6 +347,7 @@ def process_example(example: str) -> str:
             graph,
             start_pos=start_pos,
             start_heading=start_heading,
+            labeled_segments=segment.labeled_segments,
         )
 
     with step(timings, "high_geometry"):
@@ -321,6 +376,14 @@ def process_example(example: str) -> str:
             low_geometry,
             high_geometry,
             optimized,
+            example,
+            start_pos=start_pos,
+            start_heading=start_heading,
+        )
+        Visualize.command_labeling(
+            skeleton,
+            segment,
+            low_geometry,
             example,
             start_pos=start_pos,
             start_heading=start_heading,

@@ -11,6 +11,7 @@ import math
 from typing import List, Optional, Tuple, Sequence
 
 import numpy as np
+from numpy.typing import NDArray
 from PIL import Image, ImageDraw
 
 from .commands import DrawingCommand
@@ -1607,3 +1608,362 @@ def commands_to_overlay(
     if output_path is not None:
         result.save(output_path)
     return result
+
+
+# ---------------------------------------------------------------------------
+# Labeling debug visualizations
+#
+# These verify the per-pixel/per-segment back-pointers that the
+# skeletonize, segment, and vectorize stages now carry. Each picks a
+# palette with one colour per label and renders every pixel in the
+# colour of its label. The palette uses golden-ratio hue spacing
+# (the same trick visualize/segment.py already uses for segment
+# colours) so adjacent labels — which are renumbered every time —
+# come out with maximally distinct hues. That way you can eyeball
+# the partition at a junction and see immediately whether two
+# adjacent regions were collapsed into one or split correctly.
+# ---------------------------------------------------------------------------
+
+
+def _golden_ratio_palette(
+    n: int,
+    *,
+    sat: float = 0.85,
+    light: float = 0.58,
+    seed_hue: float = 0.07,
+) -> NDArray[np.uint8]:
+    """Return an ``(n, 3)`` uint8 palette with golden-ratio hue spacing.
+
+    Adjacent indices land far apart in hue regardless of ``n`` — what
+    we want for label-based visualizations, where the label IDs that
+    sit next to each other spatially also sit next to each other in
+    the palette index.
+    """
+    import colorsys
+
+    if n <= 0:
+        return np.zeros((0, 3), dtype=np.uint8)
+    phi = 0.618033988749895
+    out = np.zeros((n, 3), dtype=np.uint8)
+    h = seed_hue % 1.0
+    for i in range(n):
+        r, g, b = colorsys.hls_to_rgb(h, light, sat)
+        out[i] = (int(round(r * 255)), int(round(g * 255)), int(round(b * 255)))
+        h = (h + phi) % 1.0
+    return out
+
+
+def _renumber_for_adjacency_contrast(
+    labeling: NDArray[np.int32],
+    background: int = -1,
+) -> Tuple[NDArray[np.int32], int]:
+    """Permute label IDs so adjacent labels (in 8-connectivity) get
+    indices that are far apart modulo n, maximising the visual
+    contrast a golden-ratio palette gives them.
+
+    The naive remap is identity, which leaves the input's label IDs
+    intact: those IDs are correlated with spatial position (watershed
+    seeds were assigned in row-major scan order), so neighbours often
+    pick up consecutive palette entries. The remap below scans the
+    labels in the order they first appear in a row-major walk and
+    assigns them sequential new IDs interleaved by a stride relatively
+    prime to ``n`` — which lands neighbouring labels at well-separated
+    palette positions.
+
+    Returns ``(renumbered, n_labels)`` where ``renumbered`` has the
+    same shape as ``labeling`` with non-background values in
+    ``[0, n_labels)`` and the background unchanged.
+    """
+    flat = labeling.ravel()
+    unique_in_order: list = []
+    seen = {}
+    for v in flat:
+        if v == background or v in seen:
+            continue
+        seen[v] = len(unique_in_order)
+        unique_in_order.append(int(v))
+    n = len(unique_in_order)
+    if n == 0:
+        return labeling.copy(), 0
+
+    # Stride: small odd number coprime with n that scatters consecutive
+    # input IDs across the palette. 7 is a fine default for any n not
+    # divisible by 7; fall back to 1 if it ever isn't coprime.
+    stride = 7 if (n % 7 != 0) else (5 if (n % 5 != 0) else 3 if (n % 3 != 0) else 1)
+    new_id_for_old = np.full(max(unique_in_order) + 1, -1, dtype=np.int32)
+    for k, old in enumerate(unique_in_order):
+        new_id_for_old[old] = (k * stride) % n
+
+    out = np.full_like(labeling, background, dtype=np.int32)
+    mask = labeling != background
+    out[mask] = new_id_for_old[labeling[mask]]
+    return out, n
+
+
+def visualize_command_labeling(
+    binary: NDArray[np.bool_],
+    raw_segments: Sequence[NDArray[np.float64]],
+    labeled_commands: Sequence,
+    start_pos: Tuple[float, float] = (0.0, 0.0),
+    start_heading: float = 0.0,
+    *,
+    background: Tuple[int, int, int] = (255, 255, 255),
+    binary_color: Tuple[int, int, int] = (235, 235, 235),
+    output_path: Optional[str] = None,
+) -> Image.Image:
+    """Render the per-drawing-command raw-segment back-pointers from
+    ``LowGeometryVectorize.labeled_commands_consolidated``.
+
+    For each drawing command (pen-down line / arc / circle):
+    * sample the command's geometry between every consecutive pair of
+      ``command_start_ratio`` / ``command_end_ratio`` boundaries,
+    * paint the sampled stretch in the colour of its ``raw_segment_id``,
+    * paint the contributing raw-segment range in the same colour as a
+      faint underlay.
+
+    Adjacent spans get well-separated palette entries (golden-ratio
+    hue spacing after stride-renumbering), so an over-merged span (one
+    colour where two would be expected) or an over-split span (a hue
+    jump inside one continuous run) is visually obvious.
+
+    Spins / pen-up transit commands carry no labels and are skipped.
+    """
+    H, W = binary.shape
+
+    # Renumber raw-segment ids for adjacency contrast — same trick as
+    # the segment-stage viz.
+    ids_in_order: List[int] = []
+    seen = {}
+    for lc in labeled_commands:
+        for span in lc.spans:
+            rid = span.raw_segment_id
+            if rid in seen:
+                continue
+            seen[rid] = len(ids_in_order)
+            ids_in_order.append(rid)
+    n_distinct = len(ids_in_order)
+    stride = (
+        7 if (n_distinct > 0 and n_distinct % 7 != 0)
+        else 5 if (n_distinct > 0 and n_distinct % 5 != 0)
+        else 3 if (n_distinct > 0 and n_distinct % 3 != 0)
+        else 1
+    )
+    new_index_for_raw_id = {
+        rid: (k * stride) % max(n_distinct, 1)
+        for k, rid in enumerate(ids_in_order)
+    }
+    palette = _golden_ratio_palette(max(n_distinct, 1))
+
+    canvas = np.full((H, W, 3), background, dtype=np.uint8)
+    if binary.any():
+        canvas[binary] = binary_color
+
+    def _paint(points: NDArray[np.float64], color: Tuple[int, int, int]) -> None:
+        if len(points) == 0:
+            return
+        ix = np.clip(np.round(points[:, 0]).astype(int), 0, W - 1)
+        iy = np.clip(np.round(points[:, 1]).astype(int), 0, H - 1)
+        canvas[iy, ix] = color
+
+    # Underlay: raw segments faintly painted in their assigned colour
+    # (dim grey for raw segments no command claimed).
+    for raw_id, poly in enumerate(raw_segments):
+        if raw_id in new_index_for_raw_id:
+            color = tuple(palette[new_index_for_raw_id[raw_id]].tolist())
+        else:
+            color = (180, 180, 180)
+        _paint(np.asarray(poly, dtype=float), color)  # type: ignore[arg-type]
+
+    # Walk the command stream geometrically, paint each drawing
+    # primitive's span ranges in their raw-segment colour. Use the same
+    # simulator as ``_simulate`` to recover each drawn primitive's
+    # spatial geometry; then sample within ratio windows.
+    drawn, _pen_up, _bbox = _simulate(labeled_commands_to_commands(labeled_commands),
+                                        start_pos, start_heading)
+
+    n_samples_per_ratio = 64
+    drawing_iter = iter(drawn)
+    for lc in labeled_commands:
+        if lc.primitive_id is None or not lc.spans:
+            continue
+        try:
+            d = next(drawing_iter)
+        except StopIteration:
+            break
+        # Sample the command geometry uniformly in parameter t.
+        ts = np.linspace(0.0, 1.0, n_samples_per_ratio * max(len(lc.spans), 1) + 1)
+        if d["kind"] == "line":
+            p0, p1 = d["p0"], d["p1"]
+            pts = p0[None, :] + ts[:, None] * (p1 - p0)[None, :]
+        else:  # arc
+            center = d["center"]
+            r = float(d["radius"])
+            sweep = float(d["sweep"])
+            start_a = math.atan2(
+                d["p0"][1] - center[1], d["p0"][0] - center[0]
+            )
+            angles = start_a + ts * sweep
+            pts = center[None, :] + r * np.stack(
+                [np.cos(angles), np.sin(angles)], axis=1
+            )
+        # For each span, paint pixels whose t falls within
+        # [start_ratio, end_ratio].
+        for span in lc.spans:
+            lo = min(span.command_start_ratio, span.command_end_ratio)
+            hi = max(span.command_start_ratio, span.command_end_ratio)
+            mask = (ts >= lo) & (ts <= hi)
+            if not mask.any():
+                continue
+            color_idx = new_index_for_raw_id[span.raw_segment_id]
+            color = tuple(palette[color_idx].tolist())
+            _paint(pts[mask], color)  # type: ignore[arg-type]
+
+    img = Image.fromarray(canvas, mode="RGB")
+    if output_path is not None:
+        img.save(output_path)
+    return img
+
+
+def labeled_commands_to_commands(labeled_commands: Sequence) -> List[DrawingCommand]:
+    """Helper to strip ``LabeledCommand`` wrappers back to a plain
+    command list (the original sequence ``_simulate`` consumes)."""
+    return [lc.command for lc in labeled_commands]
+
+
+def visualize_segment_labeling(
+    binary: NDArray[np.bool_],
+    raw_segments: Sequence[NDArray[np.float64]],
+    labeled_segments: Sequence,
+    *,
+    background: Tuple[int, int, int] = (255, 255, 255),
+    binary_color: Tuple[int, int, int] = (235, 235, 235),
+    output_path: Optional[str] = None,
+) -> Image.Image:
+    """Render ``Segment.labeled_segments`` so each raw-segment span is
+    drawn in a distinct colour, with the underlying raw segments drawn
+    in the SAME colour as the spans that claim them.
+
+    Each raw-segment id gets a colour from a golden-ratio palette
+    (after renumbering for adjacency contrast across the spans that
+    appear in the final segments). The final polylines are drawn
+    pixel-by-pixel in their span's colour; the raw segments are drawn
+    as a faint underlay in their assigned colour too, so you can see
+    at a glance which raw segments contributed to which final spans
+    (and which raw segments got dropped along the way).
+
+    Adjacent spans land at well-separated palette positions, so an
+    over-merged span (two spans collapsed into one) shows as a single
+    colour where two would be expected, and an over-split span shows
+    as a hue change inside what should be one continuous run.
+    """
+    H, W = binary.shape
+
+    # The "labels" we colour against are the raw-segment ids that
+    # actually show up in any final span (raw segments that got
+    # filtered out or never matched are still drawn faintly, but they
+    # don't drive the adjacency-contrast renumbering).
+    spans_in_order: List[int] = []
+    for ls in labeled_segments:
+        for span in ls.spans:
+            spans_in_order.append(span.raw_segment_id)
+
+    # Build a renumbering that scatters adjacent span ids across the
+    # palette (the dense-1D variant of the trick used by
+    # ``_renumber_for_adjacency_contrast``).
+    seen = {}
+    unique_in_order: List[int] = []
+    for raw_id in spans_in_order:
+        if raw_id in seen:
+            continue
+        seen[raw_id] = len(unique_in_order)
+        unique_in_order.append(raw_id)
+    n_distinct = len(unique_in_order)
+    stride = (
+        7 if (n_distinct > 0 and n_distinct % 7 != 0)
+        else 5 if (n_distinct > 0 and n_distinct % 5 != 0)
+        else 3 if (n_distinct > 0 and n_distinct % 3 != 0)
+        else 1
+    )
+    new_index_for_raw_id = {
+        raw_id: (k * stride) % max(n_distinct, 1)
+        for k, raw_id in enumerate(unique_in_order)
+    }
+    palette = _golden_ratio_palette(max(n_distinct, 1))
+
+    canvas = np.full((H, W, 3), background, dtype=np.uint8)
+    if binary.any():
+        canvas[binary] = binary_color
+
+    # Underlay: every raw segment in the colour its id would map to if
+    # it survives in any final span (dim grey for raw segments that
+    # never made it through).
+    def _paint(points: NDArray[np.float64], color: Tuple[int, int, int]) -> None:
+        if len(points) == 0:
+            return
+        ix = np.clip(np.round(points[:, 0]).astype(int), 0, W - 1)
+        iy = np.clip(np.round(points[:, 1]).astype(int), 0, H - 1)
+        canvas[iy, ix] = color
+
+    for raw_id, poly in enumerate(raw_segments):
+        if raw_id in new_index_for_raw_id:
+            color = tuple(palette[new_index_for_raw_id[raw_id]].tolist())
+        else:
+            color = (180, 180, 180)
+        _paint(np.asarray(poly, dtype=float), color)  # type: ignore[arg-type]
+
+    # Overlay: every final-polyline span in its span colour, on top of
+    # the binary underlay. Adjacent spans have contrasting colours by
+    # construction, so a missing or merged span boundary is obvious.
+    for ls in labeled_segments:
+        for span in ls.spans:
+            color_idx = new_index_for_raw_id[span.raw_segment_id]
+            color = tuple(palette[color_idx].tolist())
+            seg = ls.points[span.start : span.end]
+            _paint(seg, color)  # type: ignore[arg-type]
+
+    img = Image.fromarray(canvas, mode="RGB")
+    if output_path is not None:
+        img.save(output_path)
+    return img
+
+
+def visualize_skeleton_labeling(
+    binary: NDArray[np.bool_],
+    skel: NDArray[np.bool_],
+    labeling: NDArray[np.int32],
+    *,
+    background: Tuple[int, int, int] = (255, 255, 255),
+    skel_dot_color: Tuple[int, int, int] = (0, 0, 0),
+    output_path: Optional[str] = None,
+) -> Image.Image:
+    """Render ``Skeletonize.labeling`` so each binary pixel takes the
+    colour of its assigned skeleton pixel.
+
+    Each skeleton pixel gets a distinct colour (golden-ratio hue
+    spacing after renumbering for adjacency contrast); every binary
+    pixel takes the colour of its associated skeleton pixel; the
+    skeleton itself is overlaid in black so you can see where the
+    seeds sit relative to their assigned regions.
+
+    Adjacent skeleton labels come out in different colours, so you
+    can verify at a glance that the partition at a junction respects
+    the actual stroke topology (two arms shouldn't share a colour
+    where they meet) and that no two neighbouring skeleton pixels
+    got merged into the same region.
+    """
+    H, W = binary.shape
+    renumbered, n_labels = _renumber_for_adjacency_contrast(labeling)
+    palette = _golden_ratio_palette(max(n_labels, 1))
+
+    canvas = np.full((H, W, 3), background, dtype=np.uint8)
+    mask = renumbered >= 0
+    if mask.any():
+        canvas[mask] = palette[renumbered[mask]]
+    # Black skeleton overlay so each seed is visible against its region.
+    sy, sx = np.where(skel)
+    canvas[sy, sx] = skel_dot_color
+
+    img = Image.fromarray(canvas, mode="RGB")
+    if output_path is not None:
+        img.save(output_path)
+    return img

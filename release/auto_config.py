@@ -155,6 +155,28 @@ def derive_configs(
             "max_thin_thickness": 3.0 * s,
             "reskeletonize": True,
         },
+        "eyes": {
+            # Filled-shape detector. A pupil / drawn-dot fills a small
+            # connected component whose medial-axis skeleton has
+            # collapsed to a handful of pixels. We accept the component
+            # as a "fill" when its skeleton is small AND its area-to-
+            # skeleton ratio is well above what a normal stroke
+            # produces (a stroke has ``area/skel ~ stroke_width``).
+            #
+            # * ``max_skeleton_pixels`` scales linearly with stroke
+            #   width — a slightly-noisy filled disk at sw=3 collapses
+            #   to ~1-5 pixels; at sw=6 it can collapse to ~10.
+            # * ``min_area`` scales with area — too small and we'd
+            #   trigger on 2x2 speckles; too large and we'd miss small
+            #   pupils.
+            # * ``min_fill_ratio`` is dimensionless. 4.0 sits cleanly
+            #   above any reasonable stroke (which lands at ~stroke
+            #   width, i.e. ~3) and below every filled disk we've
+            #   measured (which lands at 10x+).
+            "max_skeleton_pixels": _round_int(8 * s),
+            "min_fill_ratio": 4.0,
+            "min_area": _round_int(9 * s2),
+        },
         "detect": {
             # NOTE: the chromosome / crossing detector's parameters are
             # deliberately NOT scaled by stroke width, unlike the rest

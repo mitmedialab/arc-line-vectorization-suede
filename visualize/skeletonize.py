@@ -21,6 +21,7 @@ from matplotlib.axes import Axes
 from numpy.typing import NDArray
 
 from release.skeletonize.crossings import Crossing, DetectResult
+from release.skeletonize.eyes import EyeDetectResult
 
 # Distinct colors for the two paired strokes of a 4-arm crossing.
 # Picked to be both colorblind-friendly and clearly distinguishable
@@ -251,48 +252,127 @@ def visualize_resolution(
     return fig
 
 
+def visualize_eye_detection(
+    binary: NDArray[np.bool_],
+    skel_before: NDArray[np.bool_],
+    eye_detection: EyeDetectResult,
+    skel_after: NDArray[np.bool_],
+    *,
+    ax: Optional[Axes] = None,
+    title: Optional[str] = None,
+) -> Figure | SubFigure:
+    """Show every detected filled region with its pre-/post-resolution
+    skeleton, so you can verify the right shapes were caught and that
+    the new boundary skeleton replaces the old collapsed cluster.
+    """
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(10, 10))
+    else:
+        fig = ax.figure  # type: ignore[assignment]
+
+    ax.imshow(binary, cmap="gray_r", alpha=0.35)
+
+    for region in eye_detection.filled_regions:
+        # Tint the filled region so the source disk is obvious.
+        ys, xs = np.where(region.mask)
+        ax.scatter(xs, ys, s=4, c="#F4A261", alpha=0.35, linewidths=0)
+        # The new boundary skeleton, bright green so you can see it
+        # tracking the original disk perimeter.
+        by, bx = np.where(region.boundary)
+        ax.scatter(bx, by, s=4, c="#2A9D8F", alpha=0.95, linewidths=0)
+        # The OLD collapsed-skeleton pixels inside the region, in red
+        # — what got removed.
+        oy, ox = np.where(region.mask & skel_before)
+        ax.scatter(ox, oy, s=24, c="red", marker="x", linewidths=1.4)
+        # Callout with stats.
+        cy, cx = region.centroid
+        ratio = region.area / max(region.skeleton_pixel_count, 1)
+        label = (
+            f"area = {region.area}\n"
+            f"skel = {region.skeleton_pixel_count}\n"
+            f"ratio = {ratio:.1f}"
+        )
+        tx, ty = _annotation_offset(cy, cx, binary.shape, radius=40)
+        ax.annotate(
+            label,
+            xy=(cx, cy),
+            xytext=(tx, ty),
+            fontsize=7,
+            color="black",
+            bbox=dict(
+                boxstyle="round,pad=0.25", fc="lightyellow", ec="black", alpha=0.95
+            ),
+            arrowprops=dict(arrowstyle="->", color="#2A9D8F", lw=1.0),
+        )
+
+    H, W = binary.shape
+    ax.set_aspect("equal")
+    ax.set_xlim(-0.5, W - 0.5)
+    ax.set_ylim(H - 0.5, -0.5)
+    if title is not None:
+        ax.set_title(title)
+    return fig
+
+
 def visualize_pipeline(
     binary: NDArray[np.bool_],
     skel_before: NDArray[np.bool_],
+    eye_detection: EyeDetectResult,
+    eyes_resolved: NDArray[np.bool_],
     detection: DetectResult,
     skel_after: NDArray[np.bool_],
     *,
     title: Optional[str] = None,
 ) -> Figure:
-    """Four-panel pipeline overview: binary, skeleton, detections,
+    """Six-panel pipeline overview: binary, cleaned skeleton, eye
+    detection, eye-resolved skeleton, crossing detections, final
     resolved skeleton.
 
     Useful for end-to-end inspection of one drawing.
     """
-    fig, axes = plt.subplots(2, 2, figsize=(16, 16))
+    fig, axes = plt.subplots(2, 3, figsize=(24, 16))
 
-    # Top-left: binary.
+    # Top row: binary -> cleaned skeleton -> eye detection.
     axes[0, 0].imshow(binary, cmap="gray_r")
     axes[0, 0].set_title("binary")
     axes[0, 0].axis("off")
 
-    # Top-right: skeleton before.
     axes[0, 1].imshow(binary, cmap="gray_r", alpha=0.2)
     ys, xs = np.where(skel_before)
     axes[0, 1].scatter(xs, ys, s=1, c="#3F51B5", alpha=0.9, linewidths=0)
-    axes[0, 1].set_title("cleaned skeleton (input to resolver)")
+    axes[0, 1].set_title("cleaned skeleton (pre-eye-resolve)")
     axes[0, 1].axis("off")
     axes[0, 1].set_aspect("equal")
 
-    # Bottom-left: detections.
+    visualize_eye_detection(
+        binary,
+        skel_before,
+        eye_detection,
+        eyes_resolved,
+        ax=axes[0, 2],
+        title=f"eye detection ({len(eye_detection.filled_regions)} fills)",
+    )
+
+    # Bottom row: eye-resolved skeleton -> crossing detection -> final.
+    axes[1, 0].imshow(binary, cmap="gray_r", alpha=0.2)
+    ys, xs = np.where(eyes_resolved)
+    axes[1, 0].scatter(xs, ys, s=1, c="#3F51B5", alpha=0.9, linewidths=0)
+    axes[1, 0].set_title("eye-resolved skeleton")
+    axes[1, 0].axis("off")
+    axes[1, 0].set_aspect("equal")
+
     visualize_detection(
         binary,
         detection,
-        ax=axes[1, 0],
-        title=f"detection ({len(detection.crossings)} crossings)",
+        ax=axes[1, 1],
+        title=f"crossing detection ({len(detection.crossings)} crossings)",
     )
 
-    # Bottom-right: resolved skeleton.
-    axes[1, 1].imshow(binary, cmap="gray_r", alpha=0.2)
+    axes[1, 2].imshow(binary, cmap="gray_r", alpha=0.2)
     ys, xs = np.where(skel_after)
-    axes[1, 1].scatter(xs, ys, s=1, c="#3F51B5", alpha=0.9, linewidths=0)
+    axes[1, 2].scatter(xs, ys, s=1, c="#3F51B5", alpha=0.9, linewidths=0)
     for crossing in detection.crossings:
-        axes[1, 1].scatter(
+        axes[1, 2].scatter(
             crossing.fat_pixels[:, 1],
             crossing.fat_pixels[:, 0],
             s=12,
@@ -300,9 +380,9 @@ def visualize_pipeline(
             alpha=0.5,
             linewidths=0,
         )
-    axes[1, 1].set_title("resolved skeleton")
-    axes[1, 1].axis("off")
-    axes[1, 1].set_aspect("equal")
+    axes[1, 2].set_title("final resolved skeleton")
+    axes[1, 2].axis("off")
+    axes[1, 2].set_aspect("equal")
 
     if title is not None:
         fig.suptitle(title, fontsize=14)
