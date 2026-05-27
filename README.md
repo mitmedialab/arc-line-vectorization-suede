@@ -507,6 +507,27 @@ If you hardcode a pixel threshold inside a function instead of routing
 it through `derive_configs`, you have quietly broken scale-invariance
 for large or small drawings. Put pixel thresholds in the config.
 
+One principled exception lives in `auto_config.py` itself: the
+chromosome / crossing-detection `detect` block is deliberately *not*
+scaled. Two reasons. First, chicken-and-egg — a chromosome *is* a
+region of wide overlapping ink, and that wide ink inflates the
+distance-transform median that drives `estimate_stroke_width`, so
+scaling the crossing detector by that estimate feeds its own input
+pathology back into its tuning. Concretely, drawings with dense
+overlapping strokes can over-estimate to two or three times the true
+stroke width (and very thin drawings can under-estimate the other
+way), which is enough to miss real crossings or hallucinate false
+ones. Second, the chromosome detector already adapts to stroke width
+*locally* via its internal `local_tau` (see §3), so a global
+multiplier on top would be redundant. If you ever need genuine
+multi-resolution chromosome detection, derive its thresholds from
+`local_tau`, not from the global median estimate. The same caveat
+applies more generally: `estimate_stroke_width` is robust to most
+hand-drawn input but is not trustworthy on drawings dominated by
+filled regions or dense crosshatching, so any new pixel threshold
+that operates on exactly those regimes deserves a moment's thought
+about whether scaling is right for it.
+
 ---
 
 ## 10. Repository layout
@@ -654,4 +675,3 @@ or-opt delta O(1) (§7.3).
 polyline with total squared residual `R` is scored as `R + λk`; the
 subdivider minimizes this. `λ` is derived from the line tolerance, so
 "is one more primitive worth it" is asked in residual units.
-
