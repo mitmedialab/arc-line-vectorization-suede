@@ -88,6 +88,7 @@ class Visualize:
             "graph",
             "vectorized",
             "commands.labeling",
+            "commands.labeling.high",
             "heatmap",
             "overlay",
             "overlay.clean",
@@ -170,23 +171,34 @@ class Visualize:
         skeleton: Skeletonize,
         segment: Segment,
         low: LowGeometryVectorize,
+        high: HighGeometryVectorize,
         name: str,
         start_pos: NDArray,
         start_heading: float,
     ):
-        if low.labeled_commands_consolidated is None:
-            return
-        # Use the pre-optimization (consolidated) commands so the spans
-        # match the tour the labeler walked. OptimizeRoute reorders
-        # primitives without re-running the labeler.
-        visualize_command_labeling(
-            skeleton.binary,
-            segment.segments,
-            low.labeled_commands_consolidated,
-            start_pos=(start_pos[0], start_pos[1]),
-            start_heading=start_heading,
-            output_path=f"examples/{name}.commands.labeling.png",
-        )
+        # Low geometry: use the pre-optimization (consolidated) commands
+        # so the spans match the tour the labeler walked. OptimizeRoute
+        # reorders primitives without re-running the labeler.
+        if low.labeled_commands_consolidated is not None:
+            visualize_command_labeling(
+                skeleton.binary,
+                segment.segments,
+                low.labeled_commands_consolidated,
+                start_pos=(start_pos[0], start_pos[1]),
+                start_heading=start_heading,
+                output_path=f"examples/{name}.commands.labeling.png",
+            )
+        # High geometry: labels recovered geometrically against the same
+        # raw segments, so the two are directly comparable.
+        if high.labeled_commands is not None:
+            visualize_command_labeling(
+                skeleton.binary,
+                segment.segments,
+                high.labeled_commands,
+                start_pos=(start_pos[0], start_pos[1]),
+                start_heading=start_heading,
+                output_path=f"examples/{name}.commands.labeling.high.png",
+            )
 
     @classmethod
     def vectorized(
@@ -356,6 +368,7 @@ def process_example(example: str) -> str:
             start_pos=start_pos,
             start_heading=start_heading,
             commands=HighGeometryVectorize.Config.ToCommands(**cfg["high_geometry_commands"]),
+            raw_segments=segment.segments,
         )
 
     with step(timings, "optimize"):
@@ -384,6 +397,7 @@ def process_example(example: str) -> str:
             skeleton,
             segment,
             low_geometry,
+            high_geometry,
             example,
             start_pos=start_pos,
             start_heading=start_heading,
