@@ -49,14 +49,15 @@ from numpy.typing import NDArray
 from PIL import Image
 from scipy.ndimage import distance_transform_edt
 
-
 # Reference stroke width the hand-tuned defaults assume. Computed as
 # the rough median of stroke widths in the bundled examples — 2.8 px
 # for the smallest, 4.5 px for the largest, with most at ~3 px.
 _REF_STROKE_WIDTH_PX = 3.0
 
 
-def _load_binary(source: Union[str, NDArray[np.uint8], NDArray[np.float64]]) -> NDArray[np.bool_]:
+def _load_binary(
+    source: Union[str, NDArray[np.uint8], NDArray[np.float64]],
+) -> NDArray[np.bool_]:
     """Binarize an image source the same way ``Skeletonize`` does so the
     stroke-width estimate matches what the rest of the pipeline sees.
 
@@ -141,7 +142,6 @@ def derive_configs(
         "stroke_width_px": sw,
         "image_diagonal_px": diag,
         "scale": s,
-
         # --- Skeletonize ----------------------------------------------
         "binarize": {
             "threshold": 0.5,
@@ -156,16 +156,40 @@ def derive_configs(
             "reskeletonize": True,
         },
         "detect": {
-            "local_tau_radius": _round_int(40 * s, lo=5),
+            # NOTE: the chromosome / crossing detector's parameters are
+            # deliberately NOT scaled by stroke width, unlike the rest
+            # of this file. Two reasons:
+            #
+            #  1. Chicken-and-egg. A "chromosome" is a region where two
+            #     strokes overlap into wide ink. That wide ink inflates
+            #     ``estimate_stroke_width`` (it is a median over the
+            #     distance transform), so scaling the crossing detector
+            #     by that estimate feeds the detector's own input
+            #     pathology back into its tuning. Measured: angryhashtag
+            #     estimates 8.25 px and beachnugget 6.0 px vs a ~2.8 px
+            #     true width — scaling by s=2-2.75x then mis-sized every
+            #     threshold here and the detector missed real crossings
+            #     (scribble 2 -> 1) and hallucinated false ones
+            #     (bikelove 0 -> 1).
+            #  2. Redundant. The detector already adapts to local stroke
+            #     width itself via ``local_tau`` (the radius below sets
+            #     the neighborhood for that local estimate). A global
+            #     stroke-width multiplier on top of a locally adaptive
+            #     detector buys nothing.
+            #
+            # If genuine multi-resolution support is needed later, the
+            # right approach is to derive these distances from the
+            # detector's robust internal ``local_tau`` — not from the
+            # global median estimate.
+            "local_tau_radius": 40,
             "fat_ratio": 1.3,
-            "min_fat_area": _round_int(8 * s2),
-            "group_dilate": _round_int(15 * s),
-            "skel_ring_dilate": _round_int(5 * s),
+            "min_fat_area": 8,
+            "group_dilate": 15,
+            "skel_ring_dilate": 5,
             "pairing_tangent_steps": 8,
             "pairing_threshold": 1.2,
-            "min_chromosome_skel_length": _round_int(15 * s, lo=2),
+            "min_chromosome_skel_length": 15,
         },
-
         # --- Segment --------------------------------------------------
         "segment": {
             "min_length": 10.0 * s,
@@ -199,7 +223,6 @@ def derive_configs(
             "min_tangent_score": 0.6,
             "curvature_penalty": 1.0,
         },
-
         # --- StrokeGraph ----------------------------------------------
         "graph_build": {
             "junction_tol": 2.5 * s,
@@ -210,14 +233,12 @@ def derive_configs(
             "cluster_merge_centroid_distance": 10.0 * s,
             "cluster_merge_index_gap": 10,
         },
-
         # --- HighGeometry vectorize -----------------------------------
         "high_geometry_commands": {
             "sigma": 2.0,
             "corner_threshold": 0.25,
             "max_fit_residual": 5.0 * s,
         },
-
         # --- OptimizeRoute --------------------------------------------
         "optimize_route": {
             "pixels_per_inch": 1.0,
