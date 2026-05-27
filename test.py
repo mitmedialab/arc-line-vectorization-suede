@@ -106,6 +106,8 @@ class Visualize:
         fig = visualize_pipeline(
             skeleton.binary,
             skeleton.collapsed,
+            skeleton.eye_detection,
+            skeleton.eyes_resolved,
             skeleton.detection,
             skeleton.uncrossed,
         )
@@ -252,6 +254,7 @@ def process_example(example: str) -> str:
             Skeletonize.Config.Binarize(**cfg["binarize"]),
             Skeletonize.Config.Skeletonize(**cfg["skeletonize"]),
             Skeletonize.Config.Collapse(**cfg["collapse"]),
+            Skeletonize.Config.Eyes(**cfg["eyes"]),
             detect_config=cfg["detect"],
         )
 

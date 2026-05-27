@@ -25,6 +25,7 @@ def default_pipeline(source: ImageSource):
         Skeletonize.Config.Binarize(**cfg["binarize"]),
         Skeletonize.Config.Skeletonize(**cfg["skeletonize"]),
         Skeletonize.Config.Collapse(**cfg["collapse"]),
+        Skeletonize.Config.Eyes(**cfg["eyes"]),
         detect_config=cfg["detect"],
     )
 
