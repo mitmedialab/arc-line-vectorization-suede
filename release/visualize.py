@@ -1700,6 +1700,103 @@ def _renumber_for_adjacency_contrast(
     return out, n
 
 
+def visualize_segment_labeling(
+    binary: NDArray[np.bool_],
+    raw_segments: Sequence[NDArray[np.float64]],
+    labeled_segments: Sequence,
+    *,
+    background: Tuple[int, int, int] = (255, 255, 255),
+    binary_color: Tuple[int, int, int] = (235, 235, 235),
+    output_path: Optional[str] = None,
+) -> Image.Image:
+    """Render ``Segment.labeled_segments`` so each raw-segment span is
+    drawn in a distinct colour, with the underlying raw segments drawn
+    in the SAME colour as the spans that claim them.
+
+    Each raw-segment id gets a colour from a golden-ratio palette
+    (after renumbering for adjacency contrast across the spans that
+    appear in the final segments). The final polylines are drawn
+    pixel-by-pixel in their span's colour; the raw segments are drawn
+    as a faint underlay in their assigned colour too, so you can see
+    at a glance which raw segments contributed to which final spans
+    (and which raw segments got dropped along the way).
+
+    Adjacent spans land at well-separated palette positions, so an
+    over-merged span (two spans collapsed into one) shows as a single
+    colour where two would be expected, and an over-split span shows
+    as a hue change inside what should be one continuous run.
+    """
+    H, W = binary.shape
+
+    # The "labels" we colour against are the raw-segment ids that
+    # actually show up in any final span (raw segments that got
+    # filtered out or never matched are still drawn faintly, but they
+    # don't drive the adjacency-contrast renumbering).
+    spans_in_order: List[int] = []
+    for ls in labeled_segments:
+        for span in ls.spans:
+            spans_in_order.append(span.raw_segment_id)
+
+    # Build a renumbering that scatters adjacent span ids across the
+    # palette (the dense-1D variant of the trick used by
+    # ``_renumber_for_adjacency_contrast``).
+    seen = {}
+    unique_in_order: List[int] = []
+    for raw_id in spans_in_order:
+        if raw_id in seen:
+            continue
+        seen[raw_id] = len(unique_in_order)
+        unique_in_order.append(raw_id)
+    n_distinct = len(unique_in_order)
+    stride = (
+        7 if (n_distinct > 0 and n_distinct % 7 != 0)
+        else 5 if (n_distinct > 0 and n_distinct % 5 != 0)
+        else 3 if (n_distinct > 0 and n_distinct % 3 != 0)
+        else 1
+    )
+    new_index_for_raw_id = {
+        raw_id: (k * stride) % max(n_distinct, 1)
+        for k, raw_id in enumerate(unique_in_order)
+    }
+    palette = _golden_ratio_palette(max(n_distinct, 1))
+
+    canvas = np.full((H, W, 3), background, dtype=np.uint8)
+    if binary.any():
+        canvas[binary] = binary_color
+
+    # Underlay: every raw segment in the colour its id would map to if
+    # it survives in any final span (dim grey for raw segments that
+    # never made it through).
+    def _paint(points: NDArray[np.float64], color: Tuple[int, int, int]) -> None:
+        if len(points) == 0:
+            return
+        ix = np.clip(np.round(points[:, 0]).astype(int), 0, W - 1)
+        iy = np.clip(np.round(points[:, 1]).astype(int), 0, H - 1)
+        canvas[iy, ix] = color
+
+    for raw_id, poly in enumerate(raw_segments):
+        if raw_id in new_index_for_raw_id:
+            color = tuple(palette[new_index_for_raw_id[raw_id]].tolist())
+        else:
+            color = (180, 180, 180)
+        _paint(np.asarray(poly, dtype=float), color)  # type: ignore[arg-type]
+
+    # Overlay: every final-polyline span in its span colour, on top of
+    # the binary underlay. Adjacent spans have contrasting colours by
+    # construction, so a missing or merged span boundary is obvious.
+    for ls in labeled_segments:
+        for span in ls.spans:
+            color_idx = new_index_for_raw_id[span.raw_segment_id]
+            color = tuple(palette[color_idx].tolist())
+            seg = ls.points[span.start : span.end]
+            _paint(seg, color)  # type: ignore[arg-type]
+
+    img = Image.fromarray(canvas, mode="RGB")
+    if output_path is not None:
+        img.save(output_path)
+    return img
+
+
 def visualize_skeleton_labeling(
     binary: NDArray[np.bool_],
     skel: NDArray[np.bool_],

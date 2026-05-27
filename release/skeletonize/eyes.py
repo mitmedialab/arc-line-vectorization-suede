@@ -52,6 +52,7 @@ from typing import List, NamedTuple, Tuple, TypedDict
 import numpy as np
 from numpy.typing import NDArray
 from scipy.ndimage import binary_erosion, label as _ndi_label
+from skimage.morphology import skeletonize as _skeletonize
 
 _CONNECTIVITY_8 = np.ones((3, 3), dtype=bool)
 
@@ -153,13 +154,17 @@ def detect_filled_regions(
             continue
         if area / float(n_skel) < min_ratio:
             continue
-        # 1-pixel boundary via morphological gradient. 8-connected
-        # erosion keeps diagonal neighbours, giving a one-pixel-thick
-        # boundary on convex shapes; on very thin concavities the
-        # boundary can pick up a 2-px shoulder, but downstream tracing
-        # handles thin ribbons fine.
+        # 1-pixel boundary. First take the morphological-gradient ring
+        # (``mask & ~erode(mask)``), which is one-pixel-thick on convex
+        # convex shapes but can pick up 2-pixel shoulders on irregular
+        # hand-drawn fills — and those shoulders create degree-3 nodes
+        # downstream that fragment the trace into tiny pieces filtered
+        # out by ``min_length``. Re-skeletonizing the band collapses
+        # any wide stretches back to one pixel so trace sees a single
+        # clean closed loop.
         eroded = binary_erosion(mask, structure=_CONNECTIVITY_8)
-        boundary = mask & ~eroded
+        boundary_band = mask & ~eroded
+        boundary = _skeletonize(boundary_band).astype(bool)
         ys, xs = np.where(mask)
         centroid = (float(ys.mean()), float(xs.mean()))
         filled_regions.append(

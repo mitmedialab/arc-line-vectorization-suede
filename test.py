@@ -19,6 +19,7 @@ from release.visualize import (
     commands_to_svg,
     commands_to_svg_compare_n,
     commands_to_svg_gif_compare_n,
+    visualize_segment_labeling,
     visualize_skeleton_labeling,
 )
 from release.optimize import estimate_total_time
@@ -82,6 +83,7 @@ class Visualize:
             "skeleton",
             "skeleton.labeling",
             "segments",
+            "segments.labeling",
             "graph",
             "vectorized",
             "heatmap",
@@ -148,6 +150,17 @@ class Visualize:
                 ),
             ]
         ).save(f"examples/{name}.segments.png")
+        # Per-pixel raw-segment labeling debug: each final-polyline
+        # span coloured by its raw-segment id, with the contributing
+        # raw segments faintly underlaid in the same colour. Adjacent
+        # spans get well-separated palette positions so an over-merge
+        # or over-split is obvious.
+        visualize_segment_labeling(
+            skeleton.binary,
+            segment.segments,
+            segment.labeled_segments,
+            output_path=f"examples/{name}.segments.labeling.png",
+        )
 
     @classmethod
     def vectorized(
