@@ -19,6 +19,7 @@ from release.visualize import (
     commands_to_svg,
     commands_to_svg_compare_n,
     commands_to_svg_gif_compare_n,
+    visualize_skeleton_labeling,
 )
 from release.optimize import estimate_total_time
 
@@ -79,6 +80,7 @@ class Visualize:
         extensions = ["png", "svg", "json", "gif"]
         suffixes = [
             "skeleton",
+            "skeleton.labeling",
             "segments",
             "graph",
             "vectorized",
@@ -112,6 +114,16 @@ class Visualize:
             skeleton.uncrossed,
         )
         fig.savefig(f"examples/{name}.skeleton.png")
+        # Per-pixel labeling debug: every binary pixel coloured by the
+        # skeleton pixel it's geodesically nearest to. Lets you spot
+        # mis-attributions at junctions and verify the partition is
+        # consistent with stroke topology.
+        visualize_skeleton_labeling(
+            skeleton.binary,
+            skeleton.uncrossed,
+            skeleton.labeling,
+            output_path=f"examples/{name}.skeleton.labeling.png",
+        )
 
     @classmethod
     def segments(cls, skeleton: Skeletonize, segment: Segment, name: str):

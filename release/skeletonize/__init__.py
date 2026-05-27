@@ -17,6 +17,7 @@ from .eyes import (
     detect_filled_regions,
     resolve_filled_regions,
 )
+from .labeling import label_skeleton_pixels
 
 from typing import Literal, TypedDict, NamedTuple, Union
 
@@ -94,6 +95,12 @@ class Skeletonize:
             skeleton segment and replaces it with two straight lines
             between paired arm endpoints, restoring two non-intersecting
             paths through the crossing)
+      8. label_skeleton_pixels -> self.labeling
+            (assigns every binary pixel to the single most appropriate
+            pixel of ``self.uncrossed`` via geodesic flooding through
+            the stroke mask — the lookup that lets downstream stages
+            trace each pixel of the original image to its skeleton
+            ancestor; -1 for pixels outside the stroke mask)
 
     The final skeleton for downstream consumption is `self.uncrossed`.
     Earlier stages are kept on the instance so visualization / debug
@@ -124,6 +131,7 @@ class Skeletonize:
         eyes_resolved: NDArray[np.bool_]
         detection: DetectResult
         uncrossed: NDArray[np.bool_]
+        labeling: NDArray[np.int32]
 
     def __init__(
         self,
@@ -157,6 +165,9 @@ class Skeletonize:
         # Resolution rewrites the eye-resolved skeleton in place at
         # every detected crossing.
         self.uncrossed = resolve_crossings(self.eyes_resolved, self.detection)
+        # Per-pixel labeling — every binary pixel gets the flat index
+        # of its associated final-skeleton pixel; -1 outside the stroke.
+        self.labeling = label_skeleton_pixels(self.binary, self.uncrossed)
 
         self.output = self.Output(
             binary=self.binary,
@@ -166,4 +177,5 @@ class Skeletonize:
             eyes_resolved=self.eyes_resolved,
             detection=self.detection,
             uncrossed=self.uncrossed,
+            labeling=self.labeling,
         )

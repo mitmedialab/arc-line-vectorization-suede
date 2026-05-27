@@ -11,6 +11,7 @@ import math
 from typing import List, Optional, Tuple, Sequence
 
 import numpy as np
+from numpy.typing import NDArray
 from PIL import Image, ImageDraw
 
 from .commands import DrawingCommand
@@ -1607,3 +1608,135 @@ def commands_to_overlay(
     if output_path is not None:
         result.save(output_path)
     return result
+
+
+# ---------------------------------------------------------------------------
+# Labeling debug visualizations
+#
+# These verify the per-pixel/per-segment back-pointers that the
+# skeletonize, segment, and vectorize stages now carry. Each picks a
+# palette with one colour per label and renders every pixel in the
+# colour of its label. The palette uses golden-ratio hue spacing
+# (the same trick visualize/segment.py already uses for segment
+# colours) so adjacent labels — which are renumbered every time —
+# come out with maximally distinct hues. That way you can eyeball
+# the partition at a junction and see immediately whether two
+# adjacent regions were collapsed into one or split correctly.
+# ---------------------------------------------------------------------------
+
+
+def _golden_ratio_palette(
+    n: int,
+    *,
+    sat: float = 0.85,
+    light: float = 0.58,
+    seed_hue: float = 0.07,
+) -> NDArray[np.uint8]:
+    """Return an ``(n, 3)`` uint8 palette with golden-ratio hue spacing.
+
+    Adjacent indices land far apart in hue regardless of ``n`` — what
+    we want for label-based visualizations, where the label IDs that
+    sit next to each other spatially also sit next to each other in
+    the palette index.
+    """
+    import colorsys
+
+    if n <= 0:
+        return np.zeros((0, 3), dtype=np.uint8)
+    phi = 0.618033988749895
+    out = np.zeros((n, 3), dtype=np.uint8)
+    h = seed_hue % 1.0
+    for i in range(n):
+        r, g, b = colorsys.hls_to_rgb(h, light, sat)
+        out[i] = (int(round(r * 255)), int(round(g * 255)), int(round(b * 255)))
+        h = (h + phi) % 1.0
+    return out
+
+
+def _renumber_for_adjacency_contrast(
+    labeling: NDArray[np.int32],
+    background: int = -1,
+) -> Tuple[NDArray[np.int32], int]:
+    """Permute label IDs so adjacent labels (in 8-connectivity) get
+    indices that are far apart modulo n, maximising the visual
+    contrast a golden-ratio palette gives them.
+
+    The naive remap is identity, which leaves the input's label IDs
+    intact: those IDs are correlated with spatial position (watershed
+    seeds were assigned in row-major scan order), so neighbours often
+    pick up consecutive palette entries. The remap below scans the
+    labels in the order they first appear in a row-major walk and
+    assigns them sequential new IDs interleaved by a stride relatively
+    prime to ``n`` — which lands neighbouring labels at well-separated
+    palette positions.
+
+    Returns ``(renumbered, n_labels)`` where ``renumbered`` has the
+    same shape as ``labeling`` with non-background values in
+    ``[0, n_labels)`` and the background unchanged.
+    """
+    flat = labeling.ravel()
+    unique_in_order: list = []
+    seen = {}
+    for v in flat:
+        if v == background or v in seen:
+            continue
+        seen[v] = len(unique_in_order)
+        unique_in_order.append(int(v))
+    n = len(unique_in_order)
+    if n == 0:
+        return labeling.copy(), 0
+
+    # Stride: small odd number coprime with n that scatters consecutive
+    # input IDs across the palette. 7 is a fine default for any n not
+    # divisible by 7; fall back to 1 if it ever isn't coprime.
+    stride = 7 if (n % 7 != 0) else (5 if (n % 5 != 0) else 3 if (n % 3 != 0) else 1)
+    new_id_for_old = np.full(max(unique_in_order) + 1, -1, dtype=np.int32)
+    for k, old in enumerate(unique_in_order):
+        new_id_for_old[old] = (k * stride) % n
+
+    out = np.full_like(labeling, background, dtype=np.int32)
+    mask = labeling != background
+    out[mask] = new_id_for_old[labeling[mask]]
+    return out, n
+
+
+def visualize_skeleton_labeling(
+    binary: NDArray[np.bool_],
+    skel: NDArray[np.bool_],
+    labeling: NDArray[np.int32],
+    *,
+    background: Tuple[int, int, int] = (255, 255, 255),
+    skel_dot_color: Tuple[int, int, int] = (0, 0, 0),
+    output_path: Optional[str] = None,
+) -> Image.Image:
+    """Render ``Skeletonize.labeling`` so each binary pixel takes the
+    colour of its assigned skeleton pixel.
+
+    Each skeleton pixel gets a distinct colour (golden-ratio hue
+    spacing after renumbering for adjacency contrast); every binary
+    pixel takes the colour of its associated skeleton pixel; the
+    skeleton itself is overlaid in black so you can see where the
+    seeds sit relative to their assigned regions.
+
+    Adjacent skeleton labels come out in different colours, so you
+    can verify at a glance that the partition at a junction respects
+    the actual stroke topology (two arms shouldn't share a colour
+    where they meet) and that no two neighbouring skeleton pixels
+    got merged into the same region.
+    """
+    H, W = binary.shape
+    renumbered, n_labels = _renumber_for_adjacency_contrast(labeling)
+    palette = _golden_ratio_palette(max(n_labels, 1))
+
+    canvas = np.full((H, W, 3), background, dtype=np.uint8)
+    mask = renumbered >= 0
+    if mask.any():
+        canvas[mask] = palette[renumbered[mask]]
+    # Black skeleton overlay so each seed is visible against its region.
+    sy, sx = np.where(skel)
+    canvas[sy, sx] = skel_dot_color
+
+    img = Image.fromarray(canvas, mode="RGB")
+    if output_path is not None:
+        img.save(output_path)
+    return img
