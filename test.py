@@ -19,6 +19,7 @@ from release.visualize import (
     commands_to_svg,
     commands_to_svg_compare_n,
     commands_to_svg_gif_compare_n,
+    visualize_command_labeling,
     visualize_segment_labeling,
     visualize_skeleton_labeling,
 )
@@ -86,6 +87,7 @@ class Visualize:
             "segments.labeling",
             "graph",
             "vectorized",
+            "commands.labeling",
             "heatmap",
             "overlay",
             "overlay.clean",
@@ -160,6 +162,30 @@ class Visualize:
             segment.segments,
             segment.labeled_segments,
             output_path=f"examples/{name}.segments.labeling.png",
+        )
+
+    @classmethod
+    def command_labeling(
+        cls,
+        skeleton: Skeletonize,
+        segment: Segment,
+        low: LowGeometryVectorize,
+        name: str,
+        start_pos: NDArray,
+        start_heading: float,
+    ):
+        if low.labeled_commands_consolidated is None:
+            return
+        # Use the pre-optimization (consolidated) commands so the spans
+        # match the tour the labeler walked. OptimizeRoute reorders
+        # primitives without re-running the labeler.
+        visualize_command_labeling(
+            skeleton.binary,
+            segment.segments,
+            low.labeled_commands_consolidated,
+            start_pos=(start_pos[0], start_pos[1]),
+            start_heading=start_heading,
+            output_path=f"examples/{name}.commands.labeling.png",
         )
 
     @classmethod
@@ -321,6 +347,7 @@ def process_example(example: str) -> str:
             graph,
             start_pos=start_pos,
             start_heading=start_heading,
+            labeled_segments=segment.labeled_segments,
         )
 
     with step(timings, "high_geometry"):
@@ -349,6 +376,14 @@ def process_example(example: str) -> str:
             low_geometry,
             high_geometry,
             optimized,
+            example,
+            start_pos=start_pos,
+            start_heading=start_heading,
+        )
+        Visualize.command_labeling(
+            skeleton,
+            segment,
+            low_geometry,
             example,
             start_pos=start_pos,
             start_heading=start_heading,

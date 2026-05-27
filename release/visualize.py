@@ -1700,6 +1700,136 @@ def _renumber_for_adjacency_contrast(
     return out, n
 
 
+def visualize_command_labeling(
+    binary: NDArray[np.bool_],
+    raw_segments: Sequence[NDArray[np.float64]],
+    labeled_commands: Sequence,
+    start_pos: Tuple[float, float] = (0.0, 0.0),
+    start_heading: float = 0.0,
+    *,
+    background: Tuple[int, int, int] = (255, 255, 255),
+    binary_color: Tuple[int, int, int] = (235, 235, 235),
+    output_path: Optional[str] = None,
+) -> Image.Image:
+    """Render the per-drawing-command raw-segment back-pointers from
+    ``LowGeometryVectorize.labeled_commands_consolidated``.
+
+    For each drawing command (pen-down line / arc / circle):
+    * sample the command's geometry between every consecutive pair of
+      ``command_start_ratio`` / ``command_end_ratio`` boundaries,
+    * paint the sampled stretch in the colour of its ``raw_segment_id``,
+    * paint the contributing raw-segment range in the same colour as a
+      faint underlay.
+
+    Adjacent spans get well-separated palette entries (golden-ratio
+    hue spacing after stride-renumbering), so an over-merged span (one
+    colour where two would be expected) or an over-split span (a hue
+    jump inside one continuous run) is visually obvious.
+
+    Spins / pen-up transit commands carry no labels and are skipped.
+    """
+    H, W = binary.shape
+
+    # Renumber raw-segment ids for adjacency contrast — same trick as
+    # the segment-stage viz.
+    ids_in_order: List[int] = []
+    seen = {}
+    for lc in labeled_commands:
+        for span in lc.spans:
+            rid = span.raw_segment_id
+            if rid in seen:
+                continue
+            seen[rid] = len(ids_in_order)
+            ids_in_order.append(rid)
+    n_distinct = len(ids_in_order)
+    stride = (
+        7 if (n_distinct > 0 and n_distinct % 7 != 0)
+        else 5 if (n_distinct > 0 and n_distinct % 5 != 0)
+        else 3 if (n_distinct > 0 and n_distinct % 3 != 0)
+        else 1
+    )
+    new_index_for_raw_id = {
+        rid: (k * stride) % max(n_distinct, 1)
+        for k, rid in enumerate(ids_in_order)
+    }
+    palette = _golden_ratio_palette(max(n_distinct, 1))
+
+    canvas = np.full((H, W, 3), background, dtype=np.uint8)
+    if binary.any():
+        canvas[binary] = binary_color
+
+    def _paint(points: NDArray[np.float64], color: Tuple[int, int, int]) -> None:
+        if len(points) == 0:
+            return
+        ix = np.clip(np.round(points[:, 0]).astype(int), 0, W - 1)
+        iy = np.clip(np.round(points[:, 1]).astype(int), 0, H - 1)
+        canvas[iy, ix] = color
+
+    # Underlay: raw segments faintly painted in their assigned colour
+    # (dim grey for raw segments no command claimed).
+    for raw_id, poly in enumerate(raw_segments):
+        if raw_id in new_index_for_raw_id:
+            color = tuple(palette[new_index_for_raw_id[raw_id]].tolist())
+        else:
+            color = (180, 180, 180)
+        _paint(np.asarray(poly, dtype=float), color)  # type: ignore[arg-type]
+
+    # Walk the command stream geometrically, paint each drawing
+    # primitive's span ranges in their raw-segment colour. Use the same
+    # simulator as ``_simulate`` to recover each drawn primitive's
+    # spatial geometry; then sample within ratio windows.
+    drawn, _pen_up, _bbox = _simulate(labeled_commands_to_commands(labeled_commands),
+                                        start_pos, start_heading)
+
+    n_samples_per_ratio = 64
+    drawing_iter = iter(drawn)
+    for lc in labeled_commands:
+        if lc.primitive_id is None or not lc.spans:
+            continue
+        try:
+            d = next(drawing_iter)
+        except StopIteration:
+            break
+        # Sample the command geometry uniformly in parameter t.
+        ts = np.linspace(0.0, 1.0, n_samples_per_ratio * max(len(lc.spans), 1) + 1)
+        if d["kind"] == "line":
+            p0, p1 = d["p0"], d["p1"]
+            pts = p0[None, :] + ts[:, None] * (p1 - p0)[None, :]
+        else:  # arc
+            center = d["center"]
+            r = float(d["radius"])
+            sweep = float(d["sweep"])
+            start_a = math.atan2(
+                d["p0"][1] - center[1], d["p0"][0] - center[0]
+            )
+            angles = start_a + ts * sweep
+            pts = center[None, :] + r * np.stack(
+                [np.cos(angles), np.sin(angles)], axis=1
+            )
+        # For each span, paint pixels whose t falls within
+        # [start_ratio, end_ratio].
+        for span in lc.spans:
+            lo = min(span.command_start_ratio, span.command_end_ratio)
+            hi = max(span.command_start_ratio, span.command_end_ratio)
+            mask = (ts >= lo) & (ts <= hi)
+            if not mask.any():
+                continue
+            color_idx = new_index_for_raw_id[span.raw_segment_id]
+            color = tuple(palette[color_idx].tolist())
+            _paint(pts[mask], color)  # type: ignore[arg-type]
+
+    img = Image.fromarray(canvas, mode="RGB")
+    if output_path is not None:
+        img.save(output_path)
+    return img
+
+
+def labeled_commands_to_commands(labeled_commands: Sequence) -> List[DrawingCommand]:
+    """Helper to strip ``LabeledCommand`` wrappers back to a plain
+    command list (the original sequence ``_simulate`` consumes)."""
+    return [lc.command for lc in labeled_commands]
+
+
 def visualize_segment_labeling(
     binary: NDArray[np.bool_],
     raw_segments: Sequence[NDArray[np.float64]],
