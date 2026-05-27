@@ -57,19 +57,41 @@ class RawSegmentSpan:
     The spans for a single final polyline tile ``[0, len(polyline))``
     with no gaps and no overlap — together they reconstruct the
     polyline exactly.
+
+    ``raw_start`` and ``raw_end`` are INCLUSIVE on both ends — the
+    first and last raw-segment indices the span touches, walking the
+    final polyline in its native order. If ``raw_end >= raw_start``
+    the contribution walks the raw segment forward; if
+    ``raw_end < raw_start`` it walks it backward (fusion can splice a
+    raw segment in reverse). To extract the raw-segment slice
+    regardless of direction, use
+    ``raw_segments[id][min(raw_start, raw_end) : max(raw_start, raw_end) + 1]``.
+    Keeping these inclusive avoids the ``-1`` edge case a half-open
+    reverse interval would land at when ending at raw index 0.
     """
 
     raw_segment_id: int
     start: int
     end: int
+    raw_start: int
+    raw_end: int
 
 
 @dataclass
 class LabeledSegment:
-    """A final polyline plus its decomposition into raw-segment spans."""
+    """A final polyline plus its decomposition into raw-segment spans.
+
+    ``raw_ids[i]`` and ``raw_indices[i]`` give the raw segment and the
+    index within that raw segment that final-polyline pixel ``i`` was
+    assigned to. They're published alongside the compressed ``spans``
+    because downstream stages (command labeling) need to slice partial
+    raw-segment ranges that don't align to span boundaries.
+    """
 
     points: NDArray[np.float64]
     spans: List[RawSegmentSpan]
+    raw_ids: NDArray[np.int32]
+    raw_indices: NDArray[np.int32]
 
 
 def assign_raw_segment_labels(
@@ -92,57 +114,85 @@ def assign_raw_segment_labels(
     ``LabeledSegment`` with an empty ``spans`` list.
     """
     # Gather every raw-segment pixel into a single KDTree, remembering
-    # which raw segment each pixel came from. cKDTree's query is what
-    # turns "nearest raw pixel" into a single vectorised call per
-    # final polyline.
+    # which raw segment each pixel came from AND that pixel's local
+    # index in its raw segment. cKDTree's query is what turns
+    # "nearest raw pixel" into a single vectorised call per final
+    # polyline.
     all_points: List[NDArray[np.float64]] = []
     all_ids: List[NDArray[np.int32]] = []
+    all_local_indices: List[NDArray[np.int32]] = []
     for raw_id, poly in enumerate(raw_segments):
         arr = np.asarray(poly, dtype=float)
         if len(arr) == 0:
             continue
         all_points.append(arr)
         all_ids.append(np.full(len(arr), raw_id, dtype=np.int32))
+        all_local_indices.append(np.arange(len(arr), dtype=np.int32))
 
     if not all_points:
         # Nothing to label against — emit empty spans for each final
         # segment so callers can iterate without a None check.
         return [
-            LabeledSegment(points=np.asarray(p, dtype=float), spans=[])
+            LabeledSegment(
+                points=np.asarray(p, dtype=float),
+                spans=[],
+                raw_ids=np.full(len(p), -1, dtype=np.int32),
+                raw_indices=np.zeros(len(p), dtype=np.int32),
+            )
             for p in final_segments
         ]
 
     raw_pixels = np.concatenate(all_points, axis=0)
     raw_ids = np.concatenate(all_ids, axis=0)
+    raw_local_indices = np.concatenate(all_local_indices, axis=0)
     tree = cKDTree(raw_pixels)
 
     out: List[LabeledSegment] = []
     for fp in final_segments:
         fp = np.asarray(fp, dtype=float)
         if len(fp) == 0:
-            out.append(LabeledSegment(points=fp, spans=[]))
+            out.append(
+                LabeledSegment(
+                    points=fp,
+                    spans=[],
+                    raw_ids=np.zeros(0, dtype=np.int32),
+                    raw_indices=np.zeros(0, dtype=np.int32),
+                )
+            )
             continue
         _, idx = tree.query(fp, k=1)
-        per_pixel = raw_ids[idx]
+        per_pixel_id = raw_ids[idx]
+        per_pixel_local = raw_local_indices[idx].astype(np.int32)
 
         spans: List[RawSegmentSpan] = []
         run_start = 0
         for i in range(1, len(fp)):
-            if per_pixel[i] != per_pixel[i - 1]:
+            if per_pixel_id[i] != per_pixel_id[i - 1]:
                 spans.append(
                     RawSegmentSpan(
-                        raw_segment_id=int(per_pixel[run_start]),
+                        raw_segment_id=int(per_pixel_id[run_start]),
                         start=run_start,
                         end=i,
+                        raw_start=int(per_pixel_local[run_start]),
+                        raw_end=int(per_pixel_local[i - 1]),
                     )
                 )
                 run_start = i
         spans.append(
             RawSegmentSpan(
-                raw_segment_id=int(per_pixel[run_start]),
+                raw_segment_id=int(per_pixel_id[run_start]),
                 start=run_start,
                 end=len(fp),
+                raw_start=int(per_pixel_local[run_start]),
+                raw_end=int(per_pixel_local[len(fp) - 1]),
             )
         )
-        out.append(LabeledSegment(points=fp, spans=spans))
+        out.append(
+            LabeledSegment(
+                points=fp,
+                spans=spans,
+                raw_ids=per_pixel_id.astype(np.int32),
+                raw_indices=per_pixel_local,
+            )
+        )
     return out

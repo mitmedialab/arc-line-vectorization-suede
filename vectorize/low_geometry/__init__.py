@@ -55,6 +55,7 @@ from ...graph import StrokeGraph
 
 from .beautify import BeautifyTolerances, detect, merge_arc_pairs, merge_into
 from .fitting import ChainPiece, fit_polyline, fuse_chain, is_near_closed_polyline
+from .labels import CommandSpan, LabeledCommand, label_commands
 from .manifest import (
     Coincide,
     G1Smooth,
@@ -79,6 +80,7 @@ from .solve import (
     solve_once,
     _bbox_diag,
 )
+from ...segment.labels import LabeledSegment
 
 # ---------------------------------------------------------------------------
 # Public configuration (typed-dict form for parity with the rest of the
@@ -208,6 +210,7 @@ class Vectorize:
         solve: Optional[SolveDict] = None,
         beautify: Optional[BeautifyDict] = None,
         route: Optional[RouteDict] = None,
+        labeled_segments: Optional[Sequence[LabeledSegment]] = None,
     ):
         self.graph = graph
         self.start_pos = np.asarray(start_pos, dtype=float)
@@ -222,6 +225,13 @@ class Vectorize:
         )
         self.beautify_tols = _beautify_tols_from(beautify_clean)
         self.route_config = dict(route or {})
+        # Optional per-pixel raw-segment labels for the polylines this
+        # vectorizer was built against. When supplied, the command stream
+        # is annotated post-routing with which raw segments each drawing
+        # command pulled from — see ``labeled_commands_consolidated``.
+        self.input_labeled_segments: Optional[Sequence[LabeledSegment]] = (
+            labeled_segments
+        )
 
         self._run()
 
@@ -490,6 +500,32 @@ class Vectorize:
             self.start_heading,
             pen_up_join_tol=pen_up_join_tol,
         )
+
+        # Per-command back-pointers: every drawing command gets a list
+        # of ``CommandSpan`` runs telling you which raw segments the
+        # primitive it draws came from, with start/end indices in the
+        # raw segment and start/end ratios along the command's
+        # geometry. Non-drawing commands (spins, pen-ups) carry an
+        # empty span list. Only produced when the caller supplied
+        # ``labeled_segments``; otherwise stays ``None``.
+        self.labeled_commands_consolidated: Optional[List[LabeledCommand]] = None
+        if self.input_labeled_segments is not None:
+            # ``primitives_consolidated`` references fitted_segments' piece
+            # ranges, which index into the SUBSAMPLED polyline that
+            # ``build_chains`` produced. ``polyline_subsample_cap`` is
+            # the same number ``build_chains`` used.
+            self.labeled_commands_consolidated = label_commands(
+                self.commands_consolidated,
+                self.tour_consolidated,
+                self.primitives_consolidated,
+                self.fitted_segments,
+                self.graph.polylines,
+                self.input_labeled_segments,
+                polyline_subsample_cap=self.fit_config.polyline_subsample_cap,
+                start_pos=self.start_pos,
+                start_heading=self.start_heading,
+                pen_up_join_tol=pen_up_join_tol,
+            )
 
     # ----------------------------------------------------------------
     # Diagnostics

@@ -49,6 +49,7 @@ def default_pipeline(source: ImageSource):
         graph,
         start_pos=start_pos,
         start_heading=start_heading,
+        labeled_segments=segment.labeled_segments,
     )
     high_geometry = HighGeometryVectorize(
         segment.fused_post_repair,
